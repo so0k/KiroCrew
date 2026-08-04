@@ -3531,7 +3531,13 @@
       "upload_file": "上传文件",
       "use_a_skill": "使用技能",
       "used": "已用",
-      "voice_input": "语音输入"
+      "voice_input": "语音输入",
+      "dev_container": "Dev Container",
+      "this_session_runs_in_a_dev_container": "此会话在 Dev Container 中运行",
+      "this_session_runs_in_a_dev_container_id": "此会话在 Dev Container 中运行 ({{id}})",
+      "withdraw_trust": "撤销信任",
+      "could_not_withdraw_trust": "无法撤销信任",
+      "withdrawing_stops_future_sessions": "撤销后，后续会话将不再使用该容器。当前会话会留在其中，直到重启为止。"
     },
     "chatPane": {
       "agent_list": "代理列表",
@@ -5191,6 +5197,31 @@
       "move_to_folder_question": "将此会话移动到 {{folder}}？",
       "no_thanks": "暂不",
       "yes_move_it": "移动"
+    },
+    "devcontainerTrustCard": {
+      "configuration": "配置",
+      "could_not_grant_trust": "无法授予信任",
+      "dev_container": "Dev Container",
+      "dev_container_trust_confirmation": "Dev Container 信任确认",
+      "dev_container_trust_prompt": "Dev Container 信任提示",
+      "dev_container_trusted": "已信任该 Dev Container",
+      "fingerprint": "指纹",
+      "got_it": "知道了",
+      "hide_details": "隐藏详情",
+      "image": "镜像",
+      "name": "名称",
+      "not_now": "暂不",
+      "nothing_is_built_or_changed": "不会构建或更改任何内容——你的会话将继续直接在本机上运行。",
+      "run_this_project_s_agent_inside_its_dev_container": "在此项目的 Dev Container 内运行其代理？",
+      "show_what_this_will_run": "查看将要运行的内容",
+      "the_next_session_for_this_project": "此项目的下一个会话将在 Dev Container 中启动。在你开启新会话之前，当前会话仍直接在本机上运行。",
+      "these_files_are_also_part_of_the_fingerprint": "这些文件同样属于该指纹，因此信任也涵盖它们。此处不显示其内容——请在项目中打开以阅读。",
+      "this_project_ships_a_dev_container": "此项目附带一个 Dev Container，即 devcontainer.json 中描述的现成环境。若选择信任，Kiro Crew 会使用 Docker 构建它并在其中运行代理，因此命令和构建都使用项目自带的工具链。",
+      "trust": "信任",
+      "trust_applies_to_this_exact_configuration": "信任仅适用于当前这份配置——配置一旦变更，系统会再次询问你。你可以通过 Dev Container 标记撤销信任。",
+      "trusting": "正在授予信任…",
+      "trusting_runs_the_setup_commands_in_this_file": "信任会运行此文件中的安装命令，并授予容器它所请求的访问权限。请仅信任你认识的项目。",
+      "while_a_session_runs_in_the_container": "会话在容器中运行期间，定时任务、子代理和已保存的经验均不可用。"
     }
   },
   "hooks": {
