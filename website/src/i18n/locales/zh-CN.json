@@ -3901,6 +3901,9 @@
       "released": "已解除与 {{label}} 的关联",
       "tooltip": "此会话与 {{label}} 双向连接：回复会发送到那里，那里发送的消息也会到达此处。"
     },
+    "infoTip": {
+      "more_information": "更多信息"
+    },
     "inlineCommentOverlay": {
       "open_comment_thread": "打开评论话题",
       "comment_other": "{{count}} 条评论",
@@ -7004,6 +7007,8 @@
       "a_unique_identifier_for_this_workspace_agents_re": "此工作区的唯一标识符。代理通过名称引用工作区。",
       "agents": "Crew",
       "also_used_by_these_crews": "{{crews}} 也在用。共用一个存储的 Crew 可以互相读取对方的文件和记忆。",
+      "bindings_preview_info": "预览。每个 Crew 独立的记忆还在开发中。Crew 有自己的工作区文件夹，但语义记忆、过往对话回溯以及全局经验都会进入每个 Crew，所以改这里还不能分开它记住的内容。",
+      "bindings_preview_notice": "预览。每个 Crew 已经读写自己的工作区文件夹，但它记住的内容还没有分开：语义记忆、过往对话回溯以及全局经验都会进入每个 Crew。每个 Crew 独立的记忆即将推出。",
       "cancel": "取消",
       "chat_with_this_crew": "与此 Crew 聊天",
       "copy_from_optional": "复制来源（可选）",
@@ -8269,7 +8274,6 @@
         "copied": "已复制",
         "update_check_managed_by_app": "此版本通过应用自身更新，不经由网关。",
         "update_check_managed_by_image": "此容器通过拉取更新的镜像来升级。",
-        "update_to_version": "更新到 v{{version}}",
         "not_checked_yet": "尚未检查",
         "notify_when_an_update_is_available": "有可用更新时通知我",
         "auto_update_notify_only_on_this_install": "此安装方式无法自行应用更新，因此仅作通知。"

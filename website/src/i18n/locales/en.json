@@ -3185,6 +3185,9 @@
       "suggested_follow_up_one": "Suggested follow-up",
       "suggested_follow_up_other": "Suggested follow-ups"
     },
+    "infoTip": {
+      "more_information": "More information"
+    },
     "inlineCommentOverlay": {
       "open_comment_thread": "Open comment thread"
     },
@@ -5004,6 +5007,8 @@
       "triggers_placeholder": "e.g. incidents, prod outages, pager escalations",
       "agents": "Crews",
       "also_used_by_these_crews": "Also used by {{crews}}. Crews that share a store can read each other’s files and memory.",
+      "bindings_preview_info": "Preview. Isolated memory per crew is still being built. A crew has its own workspace folder, but semantic memory, recall of past conversations, and global lessons reach every crew, so changing this does not separate what a crew remembers yet.",
+      "bindings_preview_notice": "Preview. A crew already reads and writes its own workspace folder, but what it remembers is not separated yet: semantic memory, recall of past conversations, and global lessons reach every crew. Isolated memory per crew is on the way.",
       "cancel": "Cancel",
       "chat_with_this_crew": "Chat with this crew",
       "copy_from_optional": "Copy from (optional)",

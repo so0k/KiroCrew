@@ -4007,6 +4007,9 @@
       "released": "Scollegata da {{label}}",
       "tooltip": "Questa sessione è bidirezionale con {{label}}: le risposte vengono recapitate lì e i messaggi inviati lì arrivano qui."
     },
+    "infoTip": {
+      "more_information": "Maggiori informazioni"
+    },
     "inlineCommentOverlay": {
       "open_comment_thread": "Apri il thread dei commenti",
       "comment_many": "{{count}} commenti",
@@ -7166,6 +7169,8 @@
       "a_unique_identifier_for_this_workspace_agents_re": "Un identificatore univoco per questo workspace. Gli agenti fanno riferimento ai workspace tramite il nome.",
       "agents": "Crews",
       "also_used_by_these_crews": "Usato anche da {{crews}}. I crew che condividono un archivio possono leggere i file e la memoria degli altri.",
+      "bindings_preview_info": "Anteprima. La memoria isolata per crew è ancora in costruzione. Un crew ha la propria cartella, ma la memoria semantica, il richiamo delle conversazioni passate e le lezioni globali arrivano a ogni crew, quindi cambiare questo non separa ciò che un crew ricorda.",
+      "bindings_preview_notice": "Anteprima. Ogni crew legge e scrive già la propria cartella, ma ciò che ricorda non è ancora separato: la memoria semantica, il richiamo delle conversazioni passate e le lezioni globali arrivano a ogni crew. La memoria isolata per crew sta arrivando.",
       "cancel": "Annulla",
       "chat_with_this_crew": "Chatta con questo crew",
       "copy_from_optional": "Copia da (facoltativo)",
@@ -8443,7 +8448,6 @@
         "copied": "Copiato",
         "update_check_managed_by_app": "Questa build si aggiorna tramite l'app, non tramite il gateway.",
         "update_check_managed_by_image": "Questo container si aggiorna scaricando un'immagine più recente.",
-        "update_to_version": "Aggiorna alla v{{version}}",
         "not_checked_yet": "Non ancora controllato",
         "notify_when_an_update_is_available": "Avvisami quando è disponibile un aggiornamento",
         "auto_update_notify_only_on_this_install": "Questa installazione non può applicare gli aggiornamenti da sola, quindi si limita ad avvisare."

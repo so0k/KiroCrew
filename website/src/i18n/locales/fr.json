@@ -4007,6 +4007,9 @@
       "released": "Dissociée de {{label}}",
       "tooltip": "Cette session est liée à {{label}} dans les deux sens : les réponses y sont transmises et les messages envoyés là-bas arrivent ici."
     },
+    "infoTip": {
+      "more_information": "Plus d’informations"
+    },
     "inlineCommentOverlay": {
       "open_comment_thread": "Ouvrir le fil de commentaires",
       "comment_many": "{{count}} commentaires",
@@ -7166,6 +7169,8 @@
       "a_unique_identifier_for_this_workspace_agents_re": "Un identifiant unique pour cet espace de travail. Les agents référencent les espaces de travail par leur nom.",
       "agents": "Crews",
       "also_used_by_these_crews": "Aussi utilisé par {{crews}}. Les crews qui partagent un stockage peuvent lire les fichiers et la mémoire des autres.",
+      "bindings_preview_info": "Aperçu. La mémoire isolée par crew est encore en construction. Un crew a son propre dossier, mais la mémoire sémantique, le rappel des conversations passées et les leçons globales atteignent tous les crews, donc changer ceci ne sépare pas ce dont un crew se souvient.",
+      "bindings_preview_notice": "Aperçu. Chaque crew lit et écrit déjà son propre dossier, mais ce dont il se souvient n’est pas encore séparé : la mémoire sémantique, le rappel des conversations passées et les leçons globales atteignent tous les crews. Une mémoire isolée par crew arrive bientôt.",
       "cancel": "Annuler",
       "chat_with_this_crew": "Discuter avec ce crew",
       "copy_from_optional": "Copier depuis (facultatif)",
@@ -8443,7 +8448,6 @@
         "copied": "Copié",
         "update_check_managed_by_app": "Cette version se met à jour via l'application, pas via la passerelle.",
         "update_check_managed_by_image": "Ce conteneur se met à jour en récupérant une image plus récente.",
-        "update_to_version": "Mettre à jour vers la v{{version}}",
         "not_checked_yet": "Pas encore vérifié",
         "notify_when_an_update_is_available": "Me prévenir quand une mise à jour est disponible",
         "auto_update_notify_only_on_this_install": "Cette installation ne peut pas appliquer les mises à jour elle-même ; elle se contente de prévenir."

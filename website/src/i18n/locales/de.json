@@ -3954,6 +3954,9 @@
       "released": "Von {{label}} gelöst",
       "tooltip": "Diese Sitzung ist bidirektional mit {{label}} verbunden: Antworten werden dorthin geliefert, und dort gesendete Nachrichten kommen hier an."
     },
+    "infoTip": {
+      "more_information": "Weitere Informationen"
+    },
     "inlineCommentOverlay": {
       "open_comment_thread": "Kommentar-Thread öffnen",
       "comment_one": "{{count}} Kommentar",
@@ -7085,6 +7088,8 @@
       "a_unique_identifier_for_this_workspace_agents_re": "Eine eindeutige Kennung für diesen Workspace. Agenten verweisen über den Namen auf Workspaces.",
       "agents": "Crews",
       "also_used_by_these_crews": "Wird auch von {{crews}} verwendet. Crews mit gemeinsamem Speicher können die Dateien und die Erinnerung der anderen lesen.",
+      "bindings_preview_info": "Vorschau. Eine eigene Erinnerung pro Crew wird noch gebaut. Eine Crew hat ihren eigenen Ordner, aber semantisches Gedächtnis, der Rückgriff auf frühere Gespräche und globale Lektionen erreichen jede Crew, deshalb trennt eine Änderung hier nicht, woran sich eine Crew erinnert.",
+      "bindings_preview_notice": "Vorschau. Jede Crew liest und schreibt schon ihren eigenen Ordner, aber was sie sich merkt, ist noch nicht getrennt: semantisches Gedächtnis, der Rückgriff auf frühere Gespräche und globale Lektionen erreichen jede Crew. Eine eigene Erinnerung pro Crew folgt bald.",
       "cancel": "Abbrechen",
       "chat_with_this_crew": "Mit dieser Crew chatten",
       "copy_from_optional": "Kopieren von (optional)",
@@ -8356,7 +8361,6 @@
         "copied": "Kopiert",
         "update_check_managed_by_app": "Dieser Build wird über die App aktualisiert, nicht über das Gateway.",
         "update_check_managed_by_image": "Dieser Container wird durch ein neueres Image aktualisiert.",
-        "update_to_version": "Auf v{{version}} aktualisieren",
         "not_checked_yet": "Noch nicht geprüft",
         "notify_when_an_update_is_available": "Benachrichtigen, wenn eine Aktualisierung verfügbar ist",
         "auto_update_notify_only_on_this_install": "Diese Installation kann Aktualisierungen nicht selbst anwenden und benachrichtigt nur."
