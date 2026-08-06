@@ -12,11 +12,11 @@
  * of rendering dead disabled controls, the page shows a distinct "not running" state
  * with an Open action, and keeps Memories visible from a local cache.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Ghost, ExternalLink } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
 import { apiGet, apiPost } from './api'
-import { REMINDER_PATHS, STATS_PATHS, POLL_MS } from './constants'
+import { REMINDERS_PATH, STATS_PATH, POLL_MS } from './constants'
 import { CC_CSS } from './styles'
 import SettingsSection from './SettingsSection'
 import RemindersSection from './RemindersSection'
@@ -28,12 +28,9 @@ export default function CrewCompanionPage() {
   const [rem, setRem] = useState<RemindersPayload | null>(null)
   /** 'offline' sentinel — the desktop app could not be reached. */
   const [remError, setRemError] = useState<string | null>(null)
-  /** Which proxy path worked, so writes go the same way reads came. */
-  const remPathRef = useRef<string | null>(null)
 
   const [mem, setMem] = useState<StatsPayload | null>(null)
   const [memOffline, setMemOffline] = useState(false)
-  const memPathRef = useRef<string | null>(null)
 
   /** Draft for the custom interval — `null` = not editing, `''` = cleared. */
   const [customMins, setCustomMins] = useState<string | null>(null)
@@ -47,34 +44,26 @@ export default function CrewCompanionPage() {
   const clearNotice = () => setNotice(null)
 
   const loadReminders = useCallback(async () => {
-    const paths = remPathRef.current ? [remPathRef.current] : REMINDER_PATHS
-    for (const path of paths) {
-      try {
-        const data = await apiGet<RemindersPayload>(path)
-        if (data && Array.isArray(data.reminders)) {
-          remPathRef.current = path
-          setRem(data)
-          setRemError(null)
-          return
-        }
-      } catch { /* try the next candidate */ }
-    }
+    try {
+      const data = await apiGet<RemindersPayload>(REMINDERS_PATH)
+      if (data && Array.isArray(data.reminders)) {
+        setRem(data)
+        setRemError(null)
+        return
+      }
+    } catch { /* fall through to the offline state below */ }
     setRemError('offline')
   }, [])
 
   const loadMemories = useCallback(async () => {
-    const paths = memPathRef.current ? [memPathRef.current] : STATS_PATHS
-    for (const path of paths) {
-      try {
-        const data = await apiGet<StatsPayload>(path)
-        if (data && data.stats) {
-          memPathRef.current = path
-          setMem(data)
-          setMemOffline(false)
-          return
-        }
-      } catch { /* try the next candidate */ }
-    }
+    try {
+      const data = await apiGet<StatsPayload>(STATS_PATH)
+      if (data && data.stats) {
+        setMem(data)
+        setMemOffline(false)
+        return
+      }
+    } catch { /* fall through to the offline state below */ }
     setMemOffline(true)
   }, [])
 
@@ -86,7 +75,8 @@ export default function CrewCompanionPage() {
     return () => clearInterval(t)
   }, [loadReminders, loadMemories])
 
-  const writeBase = () => remPathRef.current || REMINDER_PATHS[0]
+  /** Writes go where reads come from — a single path now that this is a builtin. */
+  const writeBase = () => REMINDERS_PATH
 
   const setReminderCfg = useCallback((patch: ReminderConfigPatch) => {
     // Optimistic: the poll is up to POLL_MS away and the switch should move now.
@@ -136,17 +126,28 @@ export default function CrewCompanionPage() {
    * endpoint (allowed in the manifest). On a headless/remote gateway the open
    * is not possible locally, so surface the command instead of failing silently.
    */
+  /**
+   * Bring the companion back.
+   *
+   * The original page POSTed to `/open`, which launched the separate desktop app. As a
+   * builtin there is no external app to launch: the companion is an overlay window the
+   * desktop app owns. So this records the request and the overlay opens its panel on
+   * the next poll — the dashboard page has no bridge to open a window itself.
+   *
+   * If the app is switched off entirely, it is enabled first; otherwise the request
+   * would have nothing listening for it.
+   */
   const openPet = useCallback(() => {
-    apiPost<{ remote?: boolean; command?: string; message?: string }>('/api/apps/crew-companion/open')
-      .then((res) => {
-        if (res?.remote) {
-          setNotice(res.command || res.message || i18nT('components.appstore.installedAppCard.app_cannot_be_opened_kirocrew_is_running_in_a_he'))
-        } else {
-          clearNotice()
-        }
+    apiPost('/api/apps/crew-companion/window', { target: 'panel' })
+      .then(clearNotice)
+      .catch(() => {
+        apiPost('/api/apps/crew-companion/enable', {})
+          .then(clearNotice)
+          .catch((e: unknown) => {
+            setNotice(i18nT('apps.crewCompanion.offline.body', { error: errText(e) }))
+          })
       })
-      .catch((e: unknown) => setNotice(errText(e)))
-  }, [])
+  }, [clearNotice])
 
   // Memories is a look-back, not a live control — keep it visible even when the
   // pet is off by caching the last good stats and showing them (labelled) offline.
