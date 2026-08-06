@@ -10,6 +10,9 @@ export interface SkillFormData {
   tags: string
   always: boolean
   body: string
+  /** Frontmatter keys the form does not model, preserved verbatim across a
+   *  round-trip so saving from the structured editor cannot destroy them. */
+  extra?: Record<string, string>
   /** Raw markdown content (frontmatter + body). Used in raw editing mode. */
   raw?: string
 }
@@ -45,6 +48,10 @@ export function parseFrontmatter(raw: string): { meta: Record<string, string>; b
   return { meta, body: raw.slice(end + 4).trim() }
 }
 
+/** Frontmatter keys the structured form owns. Everything else is carried
+ *  through untouched — see `extra` on SkillFormData. */
+const MANAGED_KEYS = new Set(['name', 'description', 'always', 'triggers', 'tags'])
+
 /** Assemble YAML frontmatter + body from structured fields */
 export function assembleSkillContent(data: SkillFormData): string {
   // If raw mode was used, return raw content directly
@@ -63,6 +70,20 @@ export function assembleSkillContent(data: SkillFormData): string {
   if (data.always) lines.push('always: true')
   if (data.triggers) lines.push(`triggers: ${data.triggers}`)
   if (data.tags) lines.push(`tags: [${data.tags}]`)
+  // Carry through every key the form does not model. Without this, saving a
+  // skill from the structured editor destroys frontmatter the runtime reads —
+  // `repo_scope` (the matcher's repo guard) and `inject_on_trigger` (the
+  // full-body opt-out) among them — because the form rebuilds the block from
+  // its own fields rather than editing the original.
+  for (const [key, value] of Object.entries(data.extra || {})) {
+    if (MANAGED_KEYS.has(key)) continue
+    if (value.includes('\n')) {
+      lines.push(`${key}: |`)
+      for (const l of value.split('\n')) lines.push(`  ${l}`)
+    } else {
+      lines.push(`${key}: ${value}`)
+    }
+  }
   lines.push('---')
   lines.push('')
   lines.push(data.body || `# ${data.name}\n`)
@@ -84,6 +105,9 @@ export function parseSkillContent(raw: string, key: string): SkillFormData {
   const tagsRaw = meta.tags || ''
   const tags = tagsRaw.replace(/[\[\]]/g, '').trim()
 
+  const extra: Record<string, string> = {}
+  for (const [k, v] of Object.entries(meta)) if (!MANAGED_KEYS.has(k)) extra[k] = v
+
   return {
     name: meta.name || name,
     category,
@@ -92,6 +116,7 @@ export function parseSkillContent(raw: string, key: string): SkillFormData {
     tags,
     always: meta.always === 'true',
     body,
+    extra,
   }
 }
 

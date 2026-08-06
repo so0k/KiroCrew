@@ -700,6 +700,31 @@ The `false` value carries no new privilege surface: it can only reduce what a
 skill delivers, and foreign-imported skills are refused for declaring `triggers`
 at all (`onboarding_import.py`), so an import cannot reach either path.
 
+**Setting it from the dashboard.** `POST /api/skills/-/inject-on-trigger` (body
+`{name, inject}`) edits that one frontmatter line server-side via
+`SkillsLoader.set_inject_on_trigger()`, mirroring `set_pinned()` — atomic write,
+caches invalidated so the next match sees the change rather than a stale parse.
+`inject: true` REMOVES the key instead of writing `true`, because injecting is the
+default and an absent key is the honest way to say "unchanged". It refuses any
+skill whose file resolves **outside the loader's own skills dir**: `_resolve_path`
+also reaches `skills.extra_paths` and the kiro-cli user/workspace dirs so the
+listing can show those skills, but rewriting a `SKILL.md` KiroCrew does not own —
+possibly not even writable — is a side effect nobody asked for. Ownership is
+checked before the write rather than left to the UI, which does gate on source but
+does not stand between the endpoint and a direct caller. A skill with no
+frontmatter block returns False
+rather than silently succeeding, so the UI shows a failed toggle instead of a
+no-op it reports as applied. Every outcome is SEL-audited, rejections included —
+turning injection off changes what the agent is guaranteed to see, so "who made
+this skill advisory, and when" has to be answerable.
+
+`list_skills()` carries `inject_on_trigger`, `size_bytes` and `matches` so the
+Skills page can show the cost behind the choice (cost = size × matches).
+`matches` comes from the `SkillUsageLedger` and is `None` when untracked, which is
+NOT zero — an entry can also age out of the 30-day window. Consumers must also
+join against live skill keys: the ledger retains keys for skills that have since
+moved or been removed, and ranking naively by hits puts a nonexistent skill first.
+
 Unchanged: `always: true` pinned skills (skipped by the matcher entirely) and the
 explicit `$skillname` token. Set `skills.max_triggered = 0` to stop flagging
 altogether and rely only on the index, `$skillname`, and `skill_search`. The

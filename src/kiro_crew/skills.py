@@ -617,10 +617,27 @@ class SkillsLoader:
         return meta
 
     def list_skills(self) -> list[dict]:
-        """Return list of skill metadata dicts with key, name, description, path, dir, always."""
+        """Return per-skill metadata for the dashboard's Skills page.
+
+        Carries the three fields the injection-cost control needs alongside the
+        identity ones: whether the skill opted out of full-body injection, how
+        big its body is, and how often its triggers matched. Cost is the product
+        of the last two, and a user deciding whether to opt a skill out cannot
+        weigh it without both.
+
+        ``matches`` is what the TRIGGER MATCHER fired, not what the agent went
+        on to read — the ledger has counted matches since it was introduced (see
+        issue #1731), so a caller presenting it must not label it "used".
+        ``matches`` is ``None`` when the skill has no ledger entry, which is
+        different from zero: an entry can also age out of the 30-day window.
+        """
         skills: list[dict] = []
         for name, skill_file in self._iter():
             meta = self._cached_frontmatter(skill_file)
+            try:
+                size = skill_file.stat().st_size
+            except OSError:
+                size = 0
             skills.append(
                 {
                     "key": name,
@@ -629,9 +646,30 @@ class SkillsLoader:
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
                     "always": meta.get("always", "").lower() == "true",
+                    # Mirrors split_triggered: only an explicit `false` opts out,
+                    # so a malformed value reads as injecting, as it behaves.
+                    "inject_on_trigger": (
+                        meta.get("inject_on_trigger", "").strip().lower() != "false"
+                    ),
+                    "size_bytes": size,
+                    "matches": self._match_count(name),
                 }
             )
         return skills
+
+    def _match_count(self, key: str) -> int | None:
+        """Trigger matches recorded for *key*, or ``None`` when untracked.
+
+        Best-effort: the ledger is telemetry, so a missing or unreadable one
+        yields ``None`` rather than failing the whole listing.
+        """
+        if self._usage is None:
+            return None
+        try:
+            hits, _ = self._usage.score(key)
+        except Exception:
+            return None
+        return int(hits) if hits else None
 
     @staticmethod
     def _safe_name(name: str) -> bool:
@@ -1011,6 +1049,64 @@ class SkillsLoader:
         atomic_write(skill_file, new_content)
         self._invalidate_iter_cache()
         logger.info("%s auto skill: %s", "Pinned" if pinned else "Unpinned", name)
+        return True
+
+    def set_inject_on_trigger(self, name: str, inject: bool) -> bool:
+        """Opt a skill in or out of full-body injection on a trigger match.
+
+        Edits the ``inject_on_trigger:`` frontmatter line in place, mirroring
+        :meth:`set_pinned`. ``inject=False`` writes the opt-out; ``inject=True``
+        removes the line rather than writing ``true``, because injecting is the
+        default and an absent key is the honest way to say "unchanged".
+
+        Refuses any skill whose file resolves outside this loader's own skills
+        dir. ``_resolve_path`` also reaches ``skills.extra_paths`` and the
+        kiro-cli user/workspace skill dirs — directories KiroCrew does not own
+        and may not even be able to write. Rewriting a foreign ``SKILL.md``
+        because a dashboard toggle was flipped is a side effect nobody asked
+        for, so ownership is checked before the write, not left to the UI (which
+        does gate on source, but the endpoint is reachable directly).
+
+        Returns False when the skill cannot be resolved, is not ours, or has no
+        frontmatter block to edit — the caller surfaces that as a failed toggle
+        rather than silently reporting success on a no-op.
+        """
+        if not self._safe_name(name):
+            return False
+        skill_file = self._resolve_path(name)
+        if skill_file is None or not skill_file.exists():
+            return False
+        try:
+            owned_root = self._dir.resolve()
+            if not skill_file.resolve().is_relative_to(owned_root):
+                logger.warning(
+                    "Refusing to edit a skill outside %s: %s", owned_root, skill_file
+                )
+                return False
+        except OSError:
+            return False
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        m = re.match(r"^---\n(.*?)\n---\n?(.*)$", content, re.DOTALL)
+        if not m:
+            return False
+        fm_lines = [
+            ln
+            for ln in m.group(1).split("\n")
+            if not ln.strip().lower().startswith("inject_on_trigger:")
+        ]
+        if not inject:
+            fm_lines.append("inject_on_trigger: false")
+        new_content = "---\n" + "\n".join(fm_lines) + "\n---\n" + m.group(2)
+        # Atomic write (temp + rename), for the same reason set_pinned uses it:
+        # a partial write must never truncate the live SKILL.md.
+        atomic_write(skill_file, new_content)
+        self._invalidate_iter_cache()
+        logger.info(
+            "Skill %s on trigger: %s", "injects fully" if inject else "sends a pointer", name
+        )
         return True
 
     def _archive_root(self) -> Path:

@@ -81,6 +81,16 @@ export interface Lesson {
 
 export interface Skill {
   key: string; name: string; description: string; always?: boolean; source?: string; package?: string
+  /** False when the skill set `inject_on_trigger: false` — a trigger match then
+   *  contributes a one-line pointer instead of the whole SKILL.md. */
+  inject_on_trigger?: boolean
+  /** Byte length of SKILL.md — half of the injection cost (the other half is
+   *  how often the trigger fires). */
+  size_bytes?: number
+  /** Trigger matches recorded in the ledger window. `null`/absent means the
+   *  skill has no ledger entry, which is NOT the same as zero. Counts MATCHES,
+   *  not reads — see issue #1731. */
+  matches?: number | null
   /** Absolute path to SKILL.md on disk, when known. */
   path?: string
   /** Absolute path to the skill folder. */
