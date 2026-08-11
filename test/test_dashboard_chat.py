@@ -4051,6 +4051,10 @@ class TestPinnedModelWithheld:
         client = MagicMock()
         client.available_models = MagicMock(return_value=[{"modelId": m} for m in advertised])
         client.is_claude_backend = claude_backend
+        # Pinned explicitly for the same reason as is_claude_backend: a bare
+        # MagicMock auto-creates a truthy attribute, which would read as a
+        # spec-adapter client and skip the withhold under test.
+        client.is_codex_backend = False
         return client
 
     def test_pin_absent_from_advertised_is_withheld(self):
@@ -4124,6 +4128,7 @@ class TestPinnedModelWithheld:
         client = AsyncMock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client.is_claude_backend = False
+        client.is_codex_backend = False
         # The live session advertises the free tier only.
         client.available_models = MagicMock(
             return_value=[{"modelId": "auto"}, {"modelId": "claude-sonnet-5"}]
@@ -13330,6 +13335,9 @@ class TestSlotModelLiveSwitch:
 
         provider = MagicMock(spec=AcpProvider)
         provider.is_claude_backend = claude
+        # Pinned explicitly: a spec MagicMock auto-creates a truthy attribute,
+        # which would read as a codex client and change the switch semantics.
+        provider.is_codex_backend = False
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort

@@ -167,7 +167,7 @@ from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
 from kiro_crew.messaging.renderer import chunk_text
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
-from kiro_crew.providers.acp import is_claude_backend
+from kiro_crew.providers.acp import is_claude_backend, is_codex_backend
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -561,7 +561,9 @@ def _pinned_model_withheld(client: Any, model: str, provider: str) -> bool:
     """
     if not model or model == "auto" or provider == "claude_code":
         return False
-    if getattr(client, "is_claude_backend", False):
+    # Spec adapters (claude, codex) hold ids in their own namespaces, so the
+    # kiro-namespace comparison below would call every legitimate model unusable.
+    if getattr(client, "is_claude_backend", False) or getattr(client, "is_codex_backend", False):
         return False
     getter = getattr(client, "available_models", None)
     if not callable(getter):
@@ -5820,16 +5822,17 @@ async def _run_chat(
             _produced_visible_output = True
             state.broadcast_ws("chat_done", {"slot": slot.key})
 
-            # claude-agent-acp performs /compact synchronously inside session/prompt;
-            # there is no out-of-band _kiro.dev/compaction/status notification, so
-            # EVENT_COMPLETE is the done signal. Skip the kiro-only async wait.
+            # Spec adapters (claude-agent-acp, codex) perform /compact
+            # synchronously inside session/prompt; there is no out-of-band
+            # _kiro.dev/compaction/status notification, so EVENT_COMPLETE is the
+            # done signal. Skip the kiro-only async wait.
             #
             # Note: the success message is hardcoded so no redaction pass is
-            # needed today. If claude-agent-acp ever returns a compaction
+            # needed today. If a spec adapter ever returns a compaction
             # summary (e.g. via EVENT_COMPLETE payload growing a `summary`
             # field), pipe it through redact_credentials + redact_exfiltration_urls
             # before interpolation — matching the kiro-cli path below.
-            if is_claude_backend(client):
+            if is_claude_backend(client) or is_codex_backend(client):
                 msg = "✅ Conversation compacted."
                 _append_compaction_notice(state, slot, msg)
                 state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))

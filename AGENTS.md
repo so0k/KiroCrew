@@ -78,7 +78,10 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
 - **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
   `acp` and kiro-cli is REQUIRED. Keep the dormant `ACP_BACKEND_CLAUDE` /
   `_is_claude` seam in `acp/client.py` so an internal companion can re-register
-  Claude Code; do NOT re-add the public registration glue.
+  Claude Code; do NOT re-add the public registration glue. **This fork diverges
+  deliberately on one point:** `agent.acp_backend` may select the codex ACP
+  backend (ChatGPT-subscription OAuth, no API key), as recorded in
+  `docs/task-specs/2026/08/codex-acp-oauth/README.md`.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
   a default-open Slack enterprise gate, lazy STT extras.
 - **Fork UX divergences:** the Channels app is hidden from the App Store and the

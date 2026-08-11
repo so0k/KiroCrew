@@ -17,12 +17,26 @@ latched value can be arbitrarily stale. That splits the callers in two:
   history by the time the turn fails. See
   ``docs/system-specs/modules/acp-client.md`` § "Poll-driven spawn sites are
   readiness-gated".
+
+BACKEND SCOPE: every probe behind this latch asks about ``kiro-cli`` — its
+binary, its config, its sign-in. When ``agent.acp_backend`` selects a different
+adapter, that question is not the one any of these callers need answered, and
+the honest answer is "unknown", not "not ready". A ``ready=False`` latch on such
+a host is a certainty (nobody signed into kiro-cli, and nothing will), so the
+gate would 503 resume, regenerate, rewind and ``/v1/chat/completions`` forever
+while ordinary sends — deliberately ungated — kept working. That partial
+failure is worse than no gate at all, so the gate opens: the selected adapter's
+own auth surfaces as an ``AcpAuthRequired`` error card, and its readiness is
+reported up front by ``kirocrew doctor`` instead.
 """
 
 from __future__ import annotations
 
+import asyncio
+
 from aiohttp import web
 
+from kiro_crew.acp.client import configured_acp_backend
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
 _KIRO_NOT_READY_RESPONSE = {
@@ -102,8 +116,16 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
     :func:`kiro_verified_ready` — a stale ``ready=True`` is as dangerous as a
     stale ``ready=False`` here (it authorizes the history rewrite or the
     browser-opening spawn), and only these paths pay for the re-probe.
+
+    Opens unconditionally when a non-kiro ``agent.acp_backend`` is selected — the
+    kiro latch cannot speak for another adapter. See the module docstring
+    § BACKEND SCOPE.
     """
 
+    # Off the loop: a config-cache miss re-validates the whole schema, and
+    # /api/models reaches this every 8s while the picker is degraded.
+    if await asyncio.to_thread(configured_acp_backend):
+        return None
     if await kiro_verified_ready(_service(request)):
         return None
     return web.json_response(_KIRO_NOT_READY_RESPONSE, status=503)

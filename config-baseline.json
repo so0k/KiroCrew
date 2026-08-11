@@ -21,6 +21,7 @@
         "role_efforts": {},
         "reasoning_effort": "",
         "provider": "acp",
+        "acp_backend": "",
         "default_agent": "",
         "sandbox": "off",
         "sandbox_allow_no_isolation": false,
@@ -201,6 +202,23 @@
         "acp"
       ],
       "defaultValue": "acp"
+    },
+    {
+      "path": "agent.acp_backend",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "ACP Backend",
+      "help": "Which ACP backend the 'acp' provider drives. Empty (default) is kiro-cli, the KiroACP dialect. 'codex' drives OpenAI Codex over the public ACP spec using the ChatGPT-subscription OAuth that `codex login` persists under $CODEX_HOME — no API key is read or stored. kiro-only features (model-id normalization, the reasoning-effort and Tool Search cli.json overlays, kiro entitlement checks) are skipped for a non-empty backend.",
+      "hasChildren": false,
+      "enumValues": [
+        "",
+        "codex"
+      ],
+      "defaultValue": ""
     },
     {
       "path": "agent.default_agent",

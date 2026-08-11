@@ -29,8 +29,9 @@ there is exactly one concrete provider — `agent.provider` is fixed to `acp`.
 multi-provider dispatch factory. `acp/client.py` keeps a dormant
 `ACP_BACKEND_CLAUDE` seam (`AcpProvider` can in principle drive
 `claude-agent-acp`) so an internal companion can re-register a Claude backend,
-but the public provider factory never selects it — `kiro-cli` is the only
-backend.
+but the public provider factory never selects it. The only alternate backend
+this build selects is `ACP_BACKEND_CODEX` (`agent.acp_backend: "codex"`); with
+it unset, `kiro-cli` is the only backend.
 See [`../features/claude-code-provider.md`](../features/claude-code-provider.md).
 
 ### LLMProvider ABC (`providers/base.py`)
@@ -76,13 +77,27 @@ Provider-agnostic event dataclass (aliased from `AcpEvent`):
 The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess
 and speaks JSON-RPC 2.0 over stdio.
 
-**Dormant backend seam:** `AcpProvider`/`AcpClient` retain an `acp_backend`
-parameter (`"" ` → kiro-cli; `"claude"` / `ACP_BACKEND_CLAUDE` → `claude-agent-acp`)
-so an internal companion can re-register a Claude backend over the same
-client. **The public provider factory only ever selects kiro-cli** — the claude
-branch is unreachable in this build. Its binary-resolution + config-isolation
-details live in [`acp-client.md`](acp-client.md); do not re-add the registration
-glue or a provider selector (see the repo-root `CLAUDE.md`).
+**Alternate backend seam:** `AcpProvider`/`AcpClient` take an `acp_backend`
+parameter — `""` → kiro-cli; `"claude"` / `ACP_BACKEND_CLAUDE` →
+`claude-agent-acp`; `"codex"` / `ACP_BACKEND_CODEX` → a Codex ACP agent. The
+**claude** branch stays dormant (an internal companion re-registers it; the
+public factory never selects it, and no registration glue for it may be
+re-added — see the repo-root `CLAUDE.md`). The **codex** branch is selected by
+this fork through `agent.acp_backend`, with `agent.provider` still fixed to
+`"acp"`: the model turn is served by OpenAI Codex authenticated with the user's
+**ChatGPT subscription over OAuth** (`codex login` owns the flow and persists
+`$CODEX_HOME/auth.json`; **no API key**, and Kiro Crew stores no credential of
+its own — the spawned adapter reads the tokens from disk).
+
+Codex rides the same **legacy `AcpClient`** path as claude, so kiro-only
+mechanics stay off: one process per session (no session sharing, so subagents
+take the per-process path), no `AcpRuntime` demux, no workspace `cli.json`
+overlays (effort/tool search), no kiro model-id normalization (`to_acp_id`), and
+no kiro slash commands. Reasoning effort is pushed via
+`session/set_config_option` and only when the adapter advertises an `effort`
+config option; the model default stays `"auto"`, which sends no model call at
+all (backend default). Binary resolution, auth preflight, and the spec-ACP
+dialect live in [`acp-client.md`](acp-client.md).
 
 **Key APIs:**
 - `start()` → `AcpClient.ensure_ready()` (spawns process, handshake, session/new)
@@ -102,7 +117,7 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 **MCP Tool Search** (kiro backend only — see https://kiro.dev/docs/cli/mcp/tool-search/): loads MCP tool specs on demand ("search-and-call") instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. Gated by the `agent.tool_search` config toggle (default **on**; auto-surfaces as a Settings toggle since the schema is generated from the dataclass).
 - Applied via the **same** workspace `cli.json` overlay used for effort (`<work_dir>/.kiro/settings/cli.json`), written deterministically before every spawn and on each restart by `_write_tool_search_overlay` (called from `AcpProvider.__init__` and `start()`). When enabled it writes the flat keys `toolSearch.enabled=true` plus `toolSearch.minPct=0`/`toolSearch.minTokens=0` to force deferral always-on (KiroCrew sessions always carry several MCP servers); when disabled it writes `toolSearch.enabled=false` and drops the zeroed thresholds.
 - Writing both `true` and `false` makes the KiroCrew toggle authoritative over any value in the user's global `~/.kiro/settings/cli.json`. The write is merge-safe with the effort `chat.modelDefaults` keys in the same file.
-- **claude backend** — no-op. Tool Search is a kiro-cli feature; `_apply_tool_search_overlay` returns early for the claude backend and when no toggle value was threaded in (`tool_search is None`).
+- **alternate backends (claude, codex)** — no-op. Tool Search is a kiro-cli feature; `_apply_tool_search_overlay` returns early for any non-kiro backend and when no toggle value was threaded in (`tool_search is None`).
 
 - **Resume guard:** `session/load` (resume) is only attempted when the prior session transcript exists on disk (`~/.kiro/sessions/cli/<sid>.json`). A stale persisted sid with no transcript falls back to `session/new`, preventing a fresh conversation from replaying old turns (which inflated base context).
 - **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override.
@@ -113,13 +128,19 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 {
   "agent": {
     "provider": "acp",
+    "acp_backend": "",
     "model": "auto"
   }
 }
 ```
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `agent.acp_backend` (enum `["", "codex"]`, default `""` = kiro-cli) picks the ACP
+  backend *within* the one provider. `"codex"` selects the Codex ACP agent described
+  above; it changes nothing about `agent.provider`, and the claude backend is not
+  selectable here.
+- `create_provider_factory()` returns a `Callable` that creates an `AcpProvider`,
+  threading `agent.acp_backend` down to the `AcpClient`.
 
 ### MCP Server Registration
 
@@ -164,7 +185,7 @@ on `PATH`, and run `kiro-cli login`. `kirocrew doctor` reports its status.
 
 `AcpProvider.start()` branches on the backend:
 
-- **kiro (`is_claude_backend` False)** → `_start_kiro_runtime()`. This spawns an
+- **kiro (`is_kiro_backend` True)** → `_start_kiro_runtime()`. This spawns an
   `AcpRuntime` (carrying the provider's sandbox mode, extra env, and MCP-gateway
   overlay/socket), resumes via `runtime.load_session()` when a prior transcript
   exists or otherwise `runtime.create_session()`, applies the configured model,
@@ -172,8 +193,8 @@ on `PATH`, and run `kiro-cli login`. `kirocrew doctor` reports its status.
   same interface as `AcpClient`, so downstream callers are unchanged). Any
   failure after `spawn()` kills the runtime so a half-initialised session never
   leaks an orphaned `kiro-cli`.
-- **Alternate ACP backend (`is_claude_backend` True)** → legacy `AcpClient.ensure_ready()`.
+- **Alternate ACP backend (claude or codex)** → legacy `AcpClient.ensure_ready()`.
 
-`AcpProvider.is_session_sharing_eligible` returns `not is_claude_backend`; it is
+`AcpProvider.is_session_sharing_eligible` returns `is_kiro_backend`; it is
 what `SessionManager.is_session_sharing_eligible()` consults to decide whether a
 parent session can host multiplexed subagent sessions.

@@ -5315,6 +5315,19 @@ class SubagentManager:
         latter is what ``_sessions.get_or_create`` actually returns for the
         ``claude_code`` provider, so detecting it here is what makes the
         session-file cleanup target ``~/.claude`` instead of ``~/.kiro``.
+
+        A CODEX backend deliberately answers False and folds into the ``acp``
+        label for ``build_message`` / ``persist_token_record_async`` / the state
+        record. This is a two-way question, not a three-way one: the only thing
+        the caller does with the answer is choose between the two on-disk
+        transcript locations, and codex has neither — its adapter keeps
+        transcripts in its own store, so ``_cleanup_session_files_sync`` no-ops
+        against a ``~/.kiro`` path that never exists, which is the intended
+        outcome. Naming a third label here would change the persisted
+        ``provider_type`` (a usage-telemetry dimension) without giving cleanup
+        anything to clean; if codex subagent turns ever need to be told apart in
+        telemetry, add that at the recording site via
+        ``providers.acp.is_codex_backend``, not by widening this predicate.
         """
         if ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
             return True

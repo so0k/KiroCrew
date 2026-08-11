@@ -171,6 +171,53 @@ def _is_claude_backend(provider: Any) -> bool:
     return backend == "claude"
 
 
+def _acp_backend_of(provider: Any) -> str:
+    """ACP backend id of a provider ("" = kiro-cli, or not an AcpProvider)."""
+    from kiro_crew.providers.acp import AcpProvider  # circular import: providers -> session
+
+    if not isinstance(provider, AcpProvider):
+        return ""
+    return getattr(provider.client, "backend", "") or ""
+
+
+def _is_codex_backend(provider: Any) -> bool:
+    """True when *provider* drives the Codex ACP backend.
+
+    The single spelling of the codex id inside this module — lazily imported
+    from ``acp.types`` (which sits below session in the import graph) so the
+    constant, not a string literal, is what every call site compares against.
+    """
+    from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+    return _acp_backend_of(provider) == ACP_BACKEND_CODEX
+
+
+def _is_spec_adapter_backend(provider: Any) -> bool:
+    """True when *provider* drives a public-ACP-spec backend (claude or codex).
+
+    The session-level twin of ``AcpClient._is_spec_adapter``: these backends
+    compact in place on the SAME session id, so nothing keyed on that id (the
+    session_map entry) may be dropped, and there is no recycle-on-failure
+    fallback the way kiro-cli has one. Keeps ``_is_claude_backend`` as the
+    claude term so the dormant companion seam stays the single claude
+    predicate.
+    """
+    return _is_claude_backend(provider) or _is_codex_backend(provider)
+
+
+def _provider_map_label(provider: Any) -> str:
+    """session_map provider label for *provider*.
+
+    Distinct labels per backend are what let detect_provider_switch drop a
+    stale resume sid when the operator flips ``agent.acp_backend`` — a codex
+    session id must never be fed to a kiro ``session/load`` and vice versa.
+    """
+    if _is_claude_backend(provider):
+        return "claude_code"
+    backend = _acp_backend_of(provider)
+    return backend if backend else "acp"
+
+
 def _provider_effectively_alive(provider: Any) -> bool:
     """Whether a session's provider should be treated as live (NOT stale).
 
@@ -2631,6 +2678,14 @@ class SessionManager:
                                 if _pool_model
                                 else _pool_model
                             )
+                        elif _is_codex_backend(provider):
+                            # codex ids come from the adapter's advertised model
+                            # list and have no registry entry, so both sides pass
+                            # through untranslated: to_acp_id would leave them
+                            # unchanged anyway, and to_provider_id would fold an
+                            # unknown id onto a claude default.
+                            _switch_model = model
+                            _cmp_pool = _pool_model
                         else:
                             _switch_model = model_registry.to_acp_id(model)
                             _cmp_pool = (
@@ -2699,7 +2754,7 @@ class SessionManager:
                 is_cc_now = (
                     ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider)
                 ) or _is_claude_backend(provider)
-                current_provider = "claude_code" if is_cc_now else "acp"
+                current_provider = "claude_code" if is_cc_now else _provider_map_label(provider)
                 if detect_provider_switch(self._session_map, key, current_provider):
                     resume_sid = None
                     _provider_switched = True
@@ -2864,7 +2919,7 @@ class SessionManager:
                     _cwd_str = provider.cwd
                     if not is_stateless and isinstance(provider, AcpProvider):
                         sid = provider.client._session_id
-                        _prov_label = "claude_code" if _is_claude_backend(provider) else "acp"
+                        _prov_label = _provider_map_label(provider)
                         if sid:
                             self._session_map.set(key, sid, provider=_prov_label, cwd=_cwd_str)
                     elif (
@@ -3186,9 +3241,10 @@ class SessionManager:
     async def _compact_session(self, key: str, pct: float) -> None:
         """Compact a session that hit the context threshold.
 
-        Both backends compact **in place** first, so the kiro-cli process (or
-        claude SDK session) survives and any queued or agentic work continues
-        automatically — the fix for "session stops after auto-compaction".
+        Every backend compacts **in place** first, so the kiro-cli process (or
+        the spec adapter's session) survives and any queued or agentic work
+        continues automatically — the fix for "session stops after
+        auto-compaction".
 
         kiro-cli only: if the in-place ``/compact`` fails or times out, the
         session is recycled — killed so the next user message re-seeds context
@@ -3202,17 +3258,18 @@ class SessionManager:
         """
         try:
             session = self._sessions.get(key)
-            if session and _is_claude_backend(session.provider):
-                # session_map entry stays — claude SDK preserves the same
-                # session ID across the compact_boundary, no delete needed.
+            if session and _is_spec_adapter_backend(session.provider):
+                # Spec-ACP backends (claude, codex) compact in place on the same
+                # session id, so the session_map entry stays — no delete needed.
                 # The timeout wraps both semaphore acquisition and compact()
                 # itself: if a long-running prompt holds the semaphore, we
-                # still bail out instead of waiting forever.
-                claude_session = session
+                # still bail out instead of waiting forever. kiro-cli keeps its
+                # own recycle-on-failure branch below.
+                spec_session = session
 
                 async def _run_compact() -> None:
-                    async with claude_session.semaphore:
-                        await claude_session.provider.compact()
+                    async with spec_session.semaphore:
+                        await spec_session.provider.compact()
 
                 try:
                     await asyncio.wait_for(_run_compact(), timeout=COMPACT_WAIT_TIMEOUT_SECS)
@@ -3726,7 +3783,7 @@ class SessionManager:
                         # on next startup doesn't see a missing entry, default
                         # to "acp", and falsely fire a switch for users still
                         # on claude_code.
-                        _prov_label = "claude_code" if _is_claude_backend(sess.provider) else "acp"
+                        _prov_label = _provider_map_label(sess.provider)
                         self._session_map.set(key, sid, provider=_prov_label, cwd=_cwd_str)
                 elif ClaudeCodeProvider is not None and isinstance(
                     sess.provider, ClaudeCodeProvider

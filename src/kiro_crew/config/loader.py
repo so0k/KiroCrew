@@ -871,6 +871,20 @@ class AgentConfig:
         default="acp",
         metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
     )
+    acp_backend: str = field(
+        default="",
+        metadata=_meta(
+            "ACP Backend",
+            "Which ACP backend the 'acp' provider drives. Empty (default) is "
+            "kiro-cli, the KiroACP dialect. 'codex' drives OpenAI Codex over the "
+            "public ACP spec using the ChatGPT-subscription OAuth that `codex "
+            "login` persists under $CODEX_HOME — no API key is read or stored. "
+            "kiro-only features (model-id normalization, the reasoning-effort "
+            "and Tool Search cli.json overlays, kiro entitlement checks) are "
+            "skipped for a non-empty backend.",
+            enum=["", "codex"],
+        ),
+    )
     default_agent: str = field(
         default="",
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
@@ -3295,6 +3309,23 @@ def _normalize_jail(value: object) -> str:
     return JAIL_MODE_AUTO
 
 
+def _acp_backend_value(value: object) -> str:
+    """Coerce a persisted ``agent.acp_backend`` to a known backend id, else ``""``.
+
+    Deny-by-default: an unknown or non-string value normalizes to ``""``
+    (kiro-cli), because a typo'd backend id is neither the kiro dialect nor a
+    spec adapter and would spawn nothing usable. The id set is read from
+    ``acp.types`` so it cannot drift, and lazily — importing ``kiro_crew.acp``
+    at module scope would close the ``acp -> client -> session -> config.loader``
+    cycle.
+    """
+    from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+    if isinstance(value, str) and value == ACP_BACKEND_CODEX:
+        return value
+    return ""
+
+
 def _validate_activation(value: str) -> str:
     """Return *value* if it is a valid activation mode, else ``mention`` (deny-by-default)."""
     return value if value in _VALID_ACTIVATIONS else ACTIVATION_MENTION
@@ -5164,6 +5195,7 @@ class KiroCrewConfig:
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
+                acp_backend=_acp_backend_value(agent_data.get("acp_backend", "")),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
@@ -6083,6 +6115,10 @@ class KiroCrewConfig:
 
         sandbox = self.agent.sandbox
         tool_search = self.agent.tool_search
+        # "" = kiro-cli (the KiroACP dialect); "codex" drives the Codex ACP
+        # adapter. Captured once here so every provider this factory builds
+        # targets one backend for the process's lifetime.
+        acp_backend = self.agent.acp_backend or ""
         # Global default effort for new sessions. A per-slot override always
         # wins; this only fills in when the slot carries none, so a session that
         # has never touched the effort control still starts at the user's
@@ -6150,8 +6186,12 @@ class KiroCrewConfig:
             # native ids and their aliases (claude-haiku-4.5, claude-sonnet-4.5,
             # …) are DISTINCT real kiro models and must pass through unchanged,
             # not get folded to Sonnet the way the claude_code path downgrades
-            # them (the claude backend has no Haiku).
-            m = model_registry.to_acp_id(m) if m else m
+            # them (the claude backend has no Haiku). The registry maps kiro ids
+            # only, so a non-kiro backend (codex GPT ids) passes through raw:
+            # to_acp_id would not resolve them, and the adapter's own advertised
+            # ids are what session config options accept.
+            if not acp_backend:
+                m = model_registry.to_acp_id(m) if m else m
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
             # kiro cold start (or the handler's reset-then-respawn) would only
@@ -6178,7 +6218,11 @@ class KiroCrewConfig:
                 channel_id=channel_id,
                 extra_env=extra_env,
                 effort_per_model=_eff_per_model,
-                tool_search=tool_search,
+                acp_backend=acp_backend,
+                # Tool Search is a kiro-cli cli.json feature; None on any other
+                # backend leaves the toggle unwritten instead of seeding an
+                # overlay the adapter never reads.
+                tool_search=(tool_search if not acp_backend else None),
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,

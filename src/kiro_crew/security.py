@@ -4095,6 +4095,30 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     ".pypirc",
     ".netrc",
     ".git-credentials",
+    # Codex CLI OAuth store, load-bearing whenever ``agent.acp_backend`` selects
+    # the codex backend: ``codex login`` writes a live ChatGPT-subscription
+    # access + refresh token pair here, so an agent that could read it holds the
+    # user's subscription credential. The LEAF only — ``$CODEX_HOME`` also holds
+    # ``config.toml`` (whose ``approval_policy`` an operator debugging the
+    # PreToolUse gate legitimately reads) and session logs, and blocking the
+    # directory would gate those for no security gain.
+    #
+    # This list is BOTH the fs_read/fs_write gate (``is_sensitive_path``) and the
+    # source of the bash matcher (``_build_sensitive_regex`` + its
+    # verb-independent catch-all and ``_RELATIVE_SENSITIVE_RE``), so one entry
+    # covers cat/head/base64/cp/python-open and any novel verb — strictly wider
+    # than an enumerated ``DeniedCommandRule`` per verb would be, and the shared
+    # matcher is where the scope note above says to widen.
+    #
+    # The adapter itself is unaffected: it reads ``auth.json`` in-process, never
+    # through this gate, and the sandbox's path-hiding lists (``sandbox.py``'s
+    # ``_STANDARD_DIRS`` / ``_CC_DIRS`` / ``_STRICT_DIRS``) are separate from this
+    # one, so the spawn still sees the file.
+    #
+    # SCOPE LIMIT: home-anchored, like every entry here. A relocated
+    # ``$CODEX_HOME`` outside ``$HOME`` is not covered — this list has no
+    # re-anchoring hook except the crew data home's.
+    ".codex/auth.json",
     # (The Notes builtin's GitHub PAT lives under the crew data-home at
     # ``<prefix>/workspace/md-notebook/pat``; it is added below via
     # ``_CREW_SECRET_LEAVES`` so BOTH ``.kiro/crew`` and the legacy ``.kirocrew``

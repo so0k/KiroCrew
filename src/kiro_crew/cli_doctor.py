@@ -18,7 +18,7 @@ from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
 from kiro_crew import diagnostics, platform_compat, sandbox
-from kiro_crew.acp.client import KIRO_CLI_BIN
+from kiro_crew.acp.client import KIRO_CLI_BIN, configured_acp_backend
 from kiro_crew.agent import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import KiroCrewConfig
@@ -649,6 +649,97 @@ def _doctor_pod_session_bus(issues: list[str]) -> None:
         print("               taking running pods with it. " f"Fix: loginctl enable-linger {user}")
 
 
+def _doctor_codex_backend(cfg: KiroCrewConfig, issues: list[str]) -> None:
+    """Report adapter, OAuth, and approval-gate readiness for the Codex backend.
+
+    Runs only when ``agent.acp_backend`` selects codex; the default kiro-cli
+    backend already has its rows in ``Dependencies``. The first two checks are
+    the ones the spawn path preflights (``acp.client``'s resolver ladder, then
+    the existence of the Codex CLI's ``auth.json``), so a ❌ here is exactly
+    what a real turn would fail on.
+
+    Kiro Crew never reads or stores the tokens: ``codex login`` owns the
+    ChatGPT-subscription OAuth flow and the spawned adapter picks the
+    credentials up from disk itself. Hence "does the file exist" is the whole
+    auth check — validity and refresh belong to the Codex CLI.
+
+    The third row is a security boundary, not a dependency: unlike kiro-cli
+    (``--agent`` allowedTools) and claude-agent-acp (``defaultMode: default``),
+    a codex adapter decides locally whether to ask, per its OWN
+    ``approval_policy``. Under a policy that never asks, no
+    ``session/request_permission`` is emitted and Kiro Crew's PreToolUse gate is
+    never reached, so the row must be visible rather than silent.
+    """
+    from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+    if cfg.agent.acp_backend != ACP_BACKEND_CODEX:
+        return
+
+    # Local import, after the guard: the resolver ladder is a private seam in
+    # acp.client, read from its owning module so doctor's verdict and the spawn
+    # path cannot drift apart.
+    from kiro_crew.acp.client import (
+        CODEX_ACP_BIN,
+        CODEX_CLI_BIN,
+        CODEX_PERMISSION_BYPASS_POLICIES,
+        _resolve_codex_acp_argv,
+        codex_approval_policy,
+        codex_auth_json_path,
+        codex_config_toml_path,
+    )
+
+    print("\nCodex Backend")
+    argv = _resolve_codex_acp_argv()
+    if argv:
+        print(f"  adapter:     ✅ {shlex.join(argv)}")
+    else:
+        print("  adapter:     ❌ no Codex ACP agent found")
+        print(f"{_INDENT}Fix: install the Codex CLI (`{CODEX_CLI_BIN}`, which serves")
+        print(f"{_INDENT}`{CODEX_CLI_BIN} acp`) or a standalone `{CODEX_ACP_BIN}` adapter,")
+        print(f"{_INDENT}or set CODEX_ACP_BIN to the adapter's path.")
+        issues.append("codex ACP adapter")
+
+    auth_json = codex_auth_json_path()
+    if auth_json.is_file():
+        print(f"  codex login: ✅ {auth_json}")
+    else:
+        print(f"  codex login: ❌ not signed in ({auth_json} is missing)")
+        print(f"{_INDENT}Fix: run `{CODEX_CLI_BIN} login` (ChatGPT-subscription OAuth,")
+        print(f"{_INDENT}no API key) on this host and complete the browser flow.")
+        print(f"{_INDENT}Headless host: forward the OAuth callback port the login")
+        print(f"{_INDENT}flow prints (ssh -L <port>:localhost:<port>) and open the URL")
+        print(f"{_INDENT}locally, or copy an existing $CODEX_HOME/auth.json here.")
+        issues.append("codex login")
+
+    policy = codex_approval_policy()
+    config_toml = codex_config_toml_path()
+    if policy in CODEX_PERMISSION_BYPASS_POLICIES:
+        print(f"  approvals:   ⚠️  approval_policy={policy} — tool calls bypass Kiro Crew")
+        print(f"{_INDENT}The adapter auto-approves sandboxed commands without asking,")
+        print(f"{_INDENT}so the denied-command rules, the ~/.aws | ~/.ssh path block")
+        print(f"{_INDENT}and the governance ceiling are NOT consulted for them.")
+        print(f'{_INDENT}Fix: set approval_policy = "untrusted" (or "on-request") in')
+        print(f"{_INDENT}{config_toml}.")
+        issues.append("codex approval policy")
+    elif policy:
+        # Qualified, not a clean ✅: this is the TOP-LEVEL value, and
+        # `codex_approval_policy` deliberately does not resolve a `[profiles.*]`
+        # override (profile selection happens inside the adapter). The same
+        # uncertainty is what makes the bypass case a warning rather than a
+        # refusal, so it must be named here too — an unqualified "reaches the
+        # gate" would tell an operator the denied-command rules and the
+        # governance ceiling are consulted when a profile may have turned asking
+        # off.
+        print(f"  approvals:   ✅ approval_policy={policy} (top-level) — tool calls reach")
+        print(f"{_INDENT}the PreToolUse gate, UNLESS a [profiles.*] selection in")
+        print(f"{_INDENT}{config_toml} overrides it; that override is not resolved here.")
+    else:
+        print(f"  approvals:   ⚠️  approval_policy not readable from {config_toml}")
+        print(f"{_INDENT}Kiro Crew's PreToolUse gate only sees a codex tool call when the")
+        print(f'{_INDENT}adapter asks for permission. Set approval_policy = "untrusted"')
+        print(f'{_INDENT}(or "on-request") there to be sure it does.')
+
+
 def _doctor_model_url_reachable(issues: list[str]) -> None:
     """Light HTTPS-reachability probe of the resolved embedding-model URL.
 
@@ -775,6 +866,18 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # kiro-cli is THE agent backend for the public build. claude-agent-acp is
     # only the dormant protocol seam (re-registered by an internal companion),
     # so report it as optional and report kiro-cli as the backend.
+    #
+    # When ``agent.acp_backend`` selects another adapter, no turn ever spawns
+    # kiro-cli, so the two rows below describe a binary this install does not
+    # use. Neither appends to ``issues`` (they never did), but say so explicitly
+    # rather than leaving an operator to reconcile a ⏭/⏹ here against a healthy
+    # backend section further down. Read via ``configured_acp_backend`` (fails
+    # soft to kiro-cli) so an unreadable config cannot suppress the rows; the
+    # Configuration section's own ``load()`` below is stat-cached and free.
+    _selected_backend = configured_acp_backend()
+    if _selected_backend:
+        print(f"  backend:     agent.acp_backend={_selected_backend}")
+        print(f"{_INDENT}The kiro-cli rows below are informational — no turn spawns it.")
     kiro = shutil.which(KIRO_CLI_BIN)
     if kiro:
         print(f"  kiro-cli:    ✅ {kiro}")
@@ -886,6 +989,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     else:
         print(f"  config dir:  📁 {cfg_dir} (will be created)")
     print(f"  provider:    {cfg.agent.provider}")
+    if cfg.agent.acp_backend:
+        # The provider row alone reads as kiro-cli; name the driven backend so
+        # the rows below (and the Codex Backend section) are not a surprise.
+        print(f"  acp backend: {cfg.agent.acp_backend}")
     print(f"  model:       {cfg.agent.model}")
     print(f"  approval:    {cfg.agent.approval_mode}")
     _host: str = ""
@@ -912,6 +1019,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         if not _has_slack:
             print("  auth:        ⚠️  Slack not configured — token generation unavailable")
             issues.append("dashboard auth: remote bind without Slack")
+
+    # ── Codex ACP backend (only when it is the selected backend) ──
+    _doctor_codex_backend(cfg, issues)
 
     # ── Data Home (+ leftover migration archive) ──
     _doctor_data_home()

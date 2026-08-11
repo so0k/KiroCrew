@@ -16,7 +16,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
-from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.acp.client import advertised_model_ids, configured_acp_backend, model_is_unusable
 from kiro_crew.agent_discovery import (
     clear_list_agents_cache,
     list_agents,
@@ -722,6 +722,49 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
     return []
 
 
+def _advertised_alt_backend_models(request: web.Request) -> list[dict]:
+    """Picker rows for a non-kiro ``agent.acp_backend``, from its live session.
+
+    An alternate ACP adapter (codex) has no ``--list-models`` catalog to shell
+    out to and no registry entry to translate through: the ids it advertises in
+    its own ``session/new`` response ARE the wire values, which is exactly what
+    ``_wire_model_id``'s codex branch passes back to ``set_model``. So the
+    advertised list is both the only source and the authoritative one.
+
+    Newest session first, for the same reason as :func:`_entitled_kiro_models`:
+    an older session holds the snapshot its own ``session/new`` captured.
+
+    Returns ``[]`` when no session has initialized yet or the adapter advertised
+    nothing — the caller turns that into the 503 "degraded, keep polling"
+    contract rather than caching an empty picker.
+    """
+    try:
+        state: DashboardState = request.app["state"]
+        providers = state.sessions.active_providers()
+    except (KeyError, AttributeError):
+        return []
+    for provider in reversed(providers):
+        getter = getattr(provider, "available_models", None)
+        if not callable(getter):
+            continue
+        try:
+            advertised = getter()
+        except Exception:
+            continue
+        rows = [
+            {
+                "model_name": m.get("modelId", ""),
+                "display_name": m.get("name", "") or m.get("modelId", ""),
+                "description": m.get("description", ""),
+            }
+            for m in (advertised or [])
+            if m.get("modelId")
+        ]
+        if rows:
+            return rows
+    return []
+
+
 def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
     """Narrow the ``--list-models`` catalog to what a live session advertises.
 
@@ -926,7 +969,30 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
 
 
 async def api_models(request: web.Request) -> web.Response:
-    """GET /api/models — list available models from the live kiro-cli ACP session."""
+    """GET /api/models — list available models from the live ACP session."""
+    # An alternate ACP backend never runs the kiro-cli spawn below: the binary
+    # may not exist on the host, and where it does, a signed-out one 503s on
+    # every 8s poll while its catalog — kiro ids in the kiro namespace — is not
+    # even the id space this backend accepts. `_wire_model_id` would hand such an
+    # id straight back to set_model. The adapter's own advertised list is the one
+    # authority, so serve that and nothing else.
+    # Off the loop: this reads config.json (stat-fingerprint cached, but a cache
+    # miss re-validates the whole schema) and the endpoint is polled every 8s
+    # while the picker is degraded.
+    if await asyncio.to_thread(configured_acp_backend):
+        rows = _advertised_alt_backend_models(request)
+        if rows:
+            return web.json_response(rows)
+        # Degraded, not "zero models": no session has initialized yet. Same 503
+        # contract as the branches below so the client retries with backoff
+        # instead of caching an empty picker.
+        return web.json_response(
+            {
+                "error": "no live ACP session has advertised its models yet",
+                "code": "acp_backend_models_unavailable",
+            },
+            status=503,
+        )
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),

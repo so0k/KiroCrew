@@ -9,6 +9,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.acp.client import configured_acp_backend
 from kiro_crew.kiro_prerequisite import (
     KIRO_CLI_LOGIN_COMMAND,
     KIRO_CLI_SSO_LOGIN_COMMAND,
@@ -41,6 +42,36 @@ def _not_ready_snapshot(initial_setup_complete: bool = False) -> dict[str, Any]:
             platform="gateway",
             installed=True,
             initial_setup_complete=initial_setup_complete,
+        )
+    )
+    # See _LEGACY_IDLE_OPERATION: a pre-upgrade tab crashes without this key.
+    result["operation"] = legacy_idle_operation()
+    return result
+
+
+def _alt_backend_snapshot() -> dict[str, Any]:
+    """A non-blocking snapshot for a host whose turns are served by another backend.
+
+    Every probe behind this endpoint asks about ``kiro-cli``, and on a host where
+    ``agent.acp_backend`` selects a different ACP adapter no turn will ever spawn
+    it: the CLI is legitimately absent and signed out, so the real probe reports
+    not-ready forever and the SPA holds the full-screen first-run gate over a
+    working install. The readiness fields are therefore answered in the gate's own
+    vocabulary — "the prerequisite for running a turn is satisfied on this host" —
+    which is the same shaping ``_not_ready_snapshot`` does in the other direction.
+
+    ``ready`` alone would suffice for ``kiroPrerequisiteIsBlocking``;
+    ``initial_setup_complete`` is set too so a client that only consults the
+    first-run bit (or a future one that stops trusting ``ready``) also passes.
+    """
+
+    result: dict[str, Any] = asdict(
+        PrerequisiteStatus(
+            platform="gateway",
+            installed=True,
+            authenticated=True,
+            ready=True,
+            initial_setup_complete=True,
         )
     )
     # See _LEGACY_IDLE_OPERATION: a pre-upgrade tab crashes without this key.
@@ -111,12 +142,22 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
     HUMAN action (the gate's Check again) and always probes, while
     ``?refresh=auto`` is the blocking gate's machine poll, which is coalesced
     behind a short floor so several open tabs cannot multiply the spawns.
+
+    On a non-kiro ACP backend it short-circuits to a non-blocking snapshot
+    without probing, the same scope limit ``reject_if_kiro_unverified`` applies:
+    the latch this endpoint feeds speaks only for ``kiro-cli``, so answering it
+    on a host that never spawns one walls the operator out of the whole SPA.
     """
 
     if request.get("app") != "":
         denied = await _dashboard_owner_only(request)
         assert denied is not None
         return denied
+
+    if await asyncio.to_thread(configured_acp_backend):
+        return web.json_response(
+            {**_alt_backend_snapshot(), "setup_allowed": _is_dashboard_owner(request)}
+        )
 
     # Only an owner may force a host probe; a non-owner's refresh reads latched
     # state like any other poll (they receive the redacted payload regardless).

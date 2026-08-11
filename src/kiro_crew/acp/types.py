@@ -95,6 +95,11 @@ ACP_CLIENT_CAPABILITIES: dict = {
 # ── ACP Backend Identifiers ──
 
 ACP_BACKEND_CLAUDE = "claude"
+# Codex over ACP: OpenAI Codex authenticated via the user's ChatGPT
+# subscription OAuth (`codex login`, tokens in $CODEX_HOME/auth.json — no API
+# key). Selected via `agent.acp_backend`; rides the same alternate-backend
+# seam as ACP_BACKEND_CLAUDE (legacy per-session AcpClient, spec-ACP dialect).
+ACP_BACKEND_CODEX = "codex"
 
 # ── Claude backend permission modes ──
 # Values an edition writes into a per-session settings.local.json

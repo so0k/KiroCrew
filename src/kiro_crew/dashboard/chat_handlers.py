@@ -2549,7 +2549,7 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
     warm-pool post-claim switch does in ``SessionManager``: kiro wants the bare
     dotted id via ``to_acp_id`` (which translates canonical keys and passes
     kiro's own ids through unchanged), the claude backend wants the
-    ``global.anthropic.*`` id.
+    ``global.anthropic.*`` id, and codex wants its advertised id verbatim.
 
     Returns "" when the change cannot be expressed as a ``set_model`` on this
     backend, which tells the caller to fall back to a session reset.
@@ -2561,6 +2561,11 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
         # The claude backend has no id meaning "let the server choose", so
         # returning to default needs a reset.
         return "" if is_default else model_registry.to_provider_id(model_name, "claude_code")
+    if provider.is_codex_backend:
+        # codex ids are the adapter's own advertised ids — no registry entry to
+        # translate through. Like claude, it has no id meaning "server default",
+        # so returning to default needs a reset.
+        return "" if is_default else model_name
     if is_default:
         # kiro DOES express Auto as a real model id — but only switch to it when
         # this session's backend actually advertised it.
