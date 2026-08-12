@@ -8983,7 +8983,13 @@
         "total_sessions_30d": "총 세션 (30일)",
         "total_tokens": "총 토큰",
         "total_turns": "총 턴",
-        "usage_tracking_is_not_available_for": "{{provider}}에서는 사용량 추적을 사용할 수 없습니다."
+        "usage_tracking_is_not_available_for": "{{provider}}에서는 사용량 추적을 사용할 수 없습니다.",
+        "weekly_limit": "주간 한도",
+        "weekly_reset": "주간 초기화",
+        "five_hour_limit": "5시간 한도",
+        "five_hour_reset": "5시간 초기화",
+        "unlimited": "무제한",
+        "usage_as_of": "{{time}} 기준 사용량"
       },
       "vectorMemoryCard": {
         "active": "활성",

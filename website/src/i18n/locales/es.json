@@ -9209,7 +9209,13 @@
         "total_sessions_30d": "Sesiones totales (30d)",
         "total_tokens": "Tokens totales",
         "total_turns": "Turnos totales",
-        "usage_tracking_is_not_available_for": "El seguimiento de uso no está disponible para {{provider}}."
+        "usage_tracking_is_not_available_for": "El seguimiento de uso no está disponible para {{provider}}.",
+        "weekly_limit": "Límite semanal",
+        "weekly_reset": "Restablecimiento semanal",
+        "five_hour_limit": "Límite de 5 horas",
+        "five_hour_reset": "Restablecimiento de 5 horas",
+        "unlimited": "Ilimitado",
+        "usage_as_of": "Uso a fecha de {{time}}"
       },
       "vectorMemoryCard": {
         "active": "activa",

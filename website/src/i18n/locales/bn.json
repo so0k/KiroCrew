@@ -9096,7 +9096,13 @@
         "total_sessions_30d": "মোট সেশন (30d)",
         "total_tokens": "মোট টোকেন",
         "total_turns": "মোট টার্ন",
-        "usage_tracking_is_not_available_for": "{{provider}}-এর জন্য ব্যবহার ট্র্যাকিং উপলব্ধ নয়।"
+        "usage_tracking_is_not_available_for": "{{provider}}-এর জন্য ব্যবহার ট্র্যাকিং উপলব্ধ নয়।",
+        "weekly_limit": "সাপ্তাহিক সীমা",
+        "weekly_reset": "সাপ্তাহিক রিসেট",
+        "five_hour_limit": "৫-ঘণ্টার সীমা",
+        "five_hour_reset": "৫-ঘণ্টার রিসেট",
+        "unlimited": "সীমাহীন",
+        "usage_as_of": "{{time}} পর্যন্ত ব্যবহার"
       },
       "vectorMemoryCard": {
         "active": "সক্রিয়",

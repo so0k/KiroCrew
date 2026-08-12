@@ -35,6 +35,59 @@ export interface TokenBreakdown {
   total: number
 }
 
+/**
+ * Credit-plan billing as kiro-cli reports it — a used/limit quota against a
+ * named plan. The optional `provider` is the discriminant of `NormalizedBilling`;
+ * it is never set on this shape (its absence IS "kiro"), so the kiro mapping
+ * stays byte-for-byte what it always was.
+ */
+export interface KiroBilling {
+  provider?: 'kiro'
+  plan?: string
+  used?: number
+  limit?: number
+  unit: 'credits' | 'usd' | 'tokens'
+  resets?: string
+  percentUsed?: number
+}
+
+/**
+ * One codex rate-limit window. `usedPercent` is a float 0–100 (NOT a 0–1 ratio);
+ * `windowMinutes` identifies the window (10080 = weekly, 300 = the shorter ~5h
+ * one); `resetsAt` is epoch SECONDS or null. Each field is independently present.
+ */
+export interface CodexBillingWindow {
+  usedPercent: number
+  windowMinutes: number
+  resetsAt: number | null
+}
+
+/** Codex prepaid-credit state. `balance` is a string as codex reports it. */
+export interface CodexBillingCredits {
+  hasCredits: boolean
+  unlimited: boolean
+  balance: string
+}
+
+/**
+ * Billing on a codex (ChatGPT-subscription) backend. `primary`, `secondary` and
+ * `credits` are each independently JSON `null` — never zero-filled — so a missing
+ * sub-block must be omitted from the render, not shown as an empty quota.
+ * `capturedAt` is an ISO-8601 UTC string (or '' when absent); the snapshot is
+ * only as fresh as the last codex turn.
+ */
+export interface CodexBilling {
+  provider: 'codex'
+  planType: string
+  primary: CodexBillingWindow | null
+  secondary: CodexBillingWindow | null
+  credits: CodexBillingCredits | null
+  capturedAt: string
+}
+
+/** Discriminated on `provider`: absent/`'kiro'` → credit plan, `'codex'` → windows. */
+export type NormalizedBilling = KiroBilling | CodexBilling
+
 export interface NormalizedUsage {
   sessions: {
     total: number
@@ -44,14 +97,7 @@ export interface NormalizedUsage {
     avgMsgsPerSession: number
     dailyHistory: { date: string; sessions: number; messages: number; toolCalls: number }[]
   }
-  billing: {
-    plan?: string
-    used?: number
-    limit?: number
-    unit: 'credits' | 'usd' | 'tokens'
-    resets?: string
-    percentUsed?: number
-  } | null
+  billing: NormalizedBilling | null
   tokens?: TokenBreakdown
   costUsd?: number
   totalTurns?: number

@@ -2,9 +2,10 @@ import { BarChart3, AlertTriangle } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { Card, CardTitle, Badge } from '../../components/ui'
 import { useProvider } from '../../providers'
-import type { NormalizedUsage } from '../../providers'
+import type { NormalizedUsage, KiroBilling, CodexBilling, CodexBillingWindow } from '../../providers'
 import { TokenDailyChart } from './TokenDailyChart'
 import { formatCost } from '../../utils/formatCost'
+import { fmtPercent, fmtRelative } from '../../i18n/format'
 
 import { i18nT } from '../../i18n/t'
 function fmtNum(n: number): string {
@@ -36,23 +37,10 @@ export default function UsageTab() {
 
   const s = data.sessions
   const b = data.billing
-  const pct = b?.percentUsed ?? null
 
   return (
     <div className="space-y-4">
-      {b && b.plan && (
-        <Card>
-          <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.billing')}</CardTitle>
-          <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
-            <Row label={i18nT('pages.overview.usageTab.plan')} value={b.plan} />
-            <Row label={b.unit === 'tokens' ? i18nT('pages.overview.usageTab.tokens') : b.unit === 'usd' ? i18nT('pages.overview.usageTab.spend') : i18nT('pages.overview.usageTab.credits')}
-              value={b.limit ? `${b.used ?? 0} / ${b.limit}` : String(b.used ?? 0)}
-              badge={pct != null ? (pct >= 90 ? 'err' : pct >= 70 ? 'warn' : 'ok') : undefined}
-              badgeText={pct != null ? `${pct}%` : undefined} />
-            {b.resets && <Row label={i18nT('pages.overview.usageTab.resets')} value={b.resets} />}
-          </div>
-        </Card>
-      )}
+      {b && (b.provider === 'codex' ? <CodexBillingCard b={b} /> : b.plan && <KiroBillingCard b={b} />)}
 
       {data.tokens && (
         <Card>
@@ -123,6 +111,89 @@ export default function UsageTab() {
         </Card>
       )}
     </div>
+  )
+}
+
+/** kiro-cli credit-plan billing: a used/limit quota against a named plan. */
+function KiroBillingCard({ b }: { b: KiroBilling }) {
+  const pct = b.percentUsed ?? null
+  return (
+    <Card>
+      <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.billing')}</CardTitle>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
+        <Row label={i18nT('pages.overview.usageTab.plan')} value={b.plan ?? ''} />
+        <Row label={b.unit === 'tokens' ? i18nT('pages.overview.usageTab.tokens') : b.unit === 'usd' ? i18nT('pages.overview.usageTab.spend') : i18nT('pages.overview.usageTab.credits')}
+          value={b.limit ? `${b.used ?? 0} / ${b.limit}` : String(b.used ?? 0)}
+          badge={pct != null ? (pct >= 90 ? 'err' : pct >= 70 ? 'warn' : 'ok') : undefined}
+          badgeText={pct != null ? `${pct}%` : undefined} />
+        {b.resets && <Row label={i18nT('pages.overview.usageTab.resets')} value={b.resets} />}
+      </div>
+    </Card>
+  )
+}
+
+/** The severity color for a window's fill: green under 70%, amber to 90%, red above. */
+function windowBadge(usedPercent: number): 'ok' | 'warn' | 'err' {
+  return usedPercent >= 90 ? 'err' : usedPercent >= 70 ? 'warn' : 'ok'
+}
+
+/** One codex rate-limit window as a labelled percent row, with a reset row when
+ *  codex reported a reset time (epoch SECONDS → ms for JS Date). */
+function WindowRows({ label, resetLabel, w }: { label: string; resetLabel: string; w: CodexBillingWindow }) {
+  const clamped = Math.min(100, Math.max(0, w.usedPercent))
+  const pct = fmtPercent(clamped / 100, { maximumFractionDigits: 1 })
+  return (
+    <>
+      {/* The colored badge is the single source of the percent; the value slot
+          is empty because a codex window reports no used/limit pair to show. */}
+      <Row label={label} value="" badge={windowBadge(clamped)} badgeText={pct} />
+      {w.resetsAt != null && (
+        <Row label={resetLabel} value={fmtRelative(w.resetsAt * 1000)} />
+      )}
+    </>
+  )
+}
+
+/**
+ * codex (ChatGPT-subscription) billing: percent-of-window usage rather than a
+ * credit plan. Each sub-block is independently nullable, so a null window or
+ * absent credits is omitted rather than rendered as an empty quota. The snapshot
+ * is only as fresh as the last codex turn, surfaced from `capturedAt`.
+ */
+function CodexBillingCard({ b }: { b: CodexBilling }) {
+  const showCredits = b.credits != null && (b.credits.unlimited || b.credits.hasCredits)
+  return (
+    <Card>
+      <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.billing')}</CardTitle>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
+        {b.planType && <Row label={i18nT('pages.overview.usageTab.plan')} value={b.planType} />}
+        {b.primary && (
+          <WindowRows
+            label={i18nT('pages.overview.usageTab.weekly_limit')}
+            resetLabel={i18nT('pages.overview.usageTab.weekly_reset')}
+            w={b.primary}
+          />
+        )}
+        {b.secondary && (
+          <WindowRows
+            label={i18nT('pages.overview.usageTab.five_hour_limit')}
+            resetLabel={i18nT('pages.overview.usageTab.five_hour_reset')}
+            w={b.secondary}
+          />
+        )}
+        {showCredits && b.credits && (
+          <Row
+            label={i18nT('pages.overview.usageTab.credits')}
+            value={b.credits.unlimited ? i18nT('pages.overview.usageTab.unlimited') : b.credits.balance}
+          />
+        )}
+      </div>
+      {b.capturedAt && (
+        <div className="text-muted text-[12px] mt-2">
+          {i18nT('pages.overview.usageTab.usage_as_of', { time: fmtRelative(b.capturedAt) })}
+        </div>
+      )}
+    </Card>
   )
 }
 

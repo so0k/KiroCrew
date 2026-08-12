@@ -8983,7 +8983,13 @@
         "total_sessions_30d": "合計セッション（30日）",
         "total_tokens": "合計トークン",
         "total_turns": "合計ターン",
-        "usage_tracking_is_not_available_for": "{{provider}} では使用量のトラッキングを利用できません。"
+        "usage_tracking_is_not_available_for": "{{provider}} では使用量のトラッキングを利用できません。",
+        "weekly_limit": "週間上限",
+        "weekly_reset": "週間リセット",
+        "five_hour_limit": "5時間上限",
+        "five_hour_reset": "5時間リセット",
+        "unlimited": "無制限",
+        "usage_as_of": "{{time}}時点の使用状況"
       },
       "vectorMemoryCard": {
         "active": "アクティブ",

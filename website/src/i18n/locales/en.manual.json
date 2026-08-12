@@ -3129,7 +3129,13 @@
         "credits": "Credits",
         "spend": "Spend",
         "tokens": "Tokens",
-        "usage_tracking_is_not_available_for": "Usage tracking is not available for {{provider}}."
+        "usage_tracking_is_not_available_for": "Usage tracking is not available for {{provider}}.",
+        "weekly_limit": "Weekly limit",
+        "weekly_reset": "Weekly reset",
+        "five_hour_limit": "5-hour limit",
+        "five_hour_reset": "5-hour reset",
+        "unlimited": "Unlimited",
+        "usage_as_of": "Usage as of {{time}}"
       },
       "vectorMemoryCard": {
         "checking_system_status": "Checking system status…",

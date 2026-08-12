@@ -9096,7 +9096,13 @@
         "total_sessions_30d": "कुल सत्र (30d)",
         "total_tokens": "कुल टोकन",
         "total_turns": "कुल टर्न",
-        "usage_tracking_is_not_available_for": "{{provider}} के लिए उपयोग ट्रैकिंग उपलब्ध नहीं है।"
+        "usage_tracking_is_not_available_for": "{{provider}} के लिए उपयोग ट्रैकिंग उपलब्ध नहीं है।",
+        "weekly_limit": "साप्ताहिक सीमा",
+        "weekly_reset": "साप्ताहिक रीसेट",
+        "five_hour_limit": "5-घंटे की सीमा",
+        "five_hour_reset": "5-घंटे का रीसेट",
+        "unlimited": "असीमित",
+        "usage_as_of": "{{time}} तक का उपयोग"
       },
       "vectorMemoryCard": {
         "active": "सक्रिय",

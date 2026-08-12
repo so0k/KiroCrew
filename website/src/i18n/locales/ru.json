@@ -9322,7 +9322,13 @@
         "total_sessions_30d": "Всего сессий (30 дн.)",
         "total_tokens": "Всего токенов",
         "total_turns": "Всего ходов",
-        "usage_tracking_is_not_available_for": "Отслеживание использования недоступно для {{provider}}."
+        "usage_tracking_is_not_available_for": "Отслеживание использования недоступно для {{provider}}.",
+        "weekly_limit": "Недельный лимит",
+        "weekly_reset": "Недельный сброс",
+        "five_hour_limit": "5-часовой лимит",
+        "five_hour_reset": "5-часовой сброс",
+        "unlimited": "Безлимитно",
+        "usage_as_of": "Использование по состоянию на {{time}}"
       },
       "vectorMemoryCard": {
         "active": "активно",

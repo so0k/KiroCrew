@@ -82,7 +82,7 @@ function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
             {data.tokens?.total != null && <> · {fmtNum(data.tokens.total)} {i18nT('pages.overviewPage.tokens')}</>}
             {data.costUsd != null && <> · ${data.costUsd.toFixed(2)}</>}
           </div>
-          {b?.plan && (
+          {b && b.provider !== 'codex' && b.plan && (
             <div className="flex items-center gap-2 text-[12px] text-muted">
               <span>{b.plan}</span>
               {typeof b.percentUsed === 'number' && (

@@ -8983,7 +8983,13 @@
         "total_sessions_30d": "会话总数（30 天）",
         "total_tokens": "令牌总数",
         "total_turns": "总轮次",
-        "usage_tracking_is_not_available_for": "{{provider}} 不支持用量跟踪。"
+        "usage_tracking_is_not_available_for": "{{provider}} 不支持用量跟踪。",
+        "weekly_limit": "每周限额",
+        "weekly_reset": "每周重置",
+        "five_hour_limit": "5 小时限额",
+        "five_hour_reset": "5 小时重置",
+        "unlimited": "无限制",
+        "usage_as_of": "使用情况截至 {{time}}"
       },
       "vectorMemoryCard": {
         "active": "已启用",

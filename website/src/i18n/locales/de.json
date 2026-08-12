@@ -9096,7 +9096,13 @@
         "total_sessions_30d": "Sitzungen insgesamt (30 T)",
         "total_tokens": "Tokens insgesamt",
         "total_turns": "Züge insgesamt",
-        "usage_tracking_is_not_available_for": "Nutzungserfassung ist für {{provider}} nicht verfügbar."
+        "usage_tracking_is_not_available_for": "Nutzungserfassung ist für {{provider}} nicht verfügbar.",
+        "weekly_limit": "Wochenlimit",
+        "weekly_reset": "Wöchentliche Zurücksetzung",
+        "five_hour_limit": "5-Stunden-Limit",
+        "five_hour_reset": "5-Stunden-Zurücksetzung",
+        "unlimited": "Unbegrenzt",
+        "usage_as_of": "Nutzung mit Stand {{time}}"
       },
       "vectorMemoryCard": {
         "active": "aktiv",

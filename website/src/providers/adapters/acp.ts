@@ -8,6 +8,8 @@ import type {
   ProviderLabels,
   AgentBinding,
   NormalizedUsage,
+  NormalizedBilling,
+  CodexBillingWindow,
   NormalizedProviderHook,
   NormalizedPlugin,
   ModelInfo,
@@ -114,6 +116,52 @@ interface RawDailyHistory {
   sessions: number
   messages: number
   tool_calls: number
+}
+
+/** One codex rate-limit window on the wire, or JSON null when codex reports none. */
+interface RawCodexWindow {
+  used_percent?: number
+  window_minutes?: number
+  resets_at?: number | null
+}
+
+/** Prepaid-credit sub-block on the wire, or JSON null when unknown. */
+interface RawCodexCredits {
+  has_credits?: boolean
+  unlimited?: boolean
+  balance?: string
+}
+
+/**
+ * The `billing` block from /api/usage/kiro. Two shapes share one field bag:
+ * the kiro credit plan (`plan`, `credits_*`, `resets`) and the codex window set
+ * (`provider === 'codex'`, `plan_type`, `primary`/`secondary`/`credits`,
+ * `captured_at`). `{}` means "no billing to show" on either backend.
+ */
+interface RawBilling {
+  // kiro credit-plan shape
+  plan?: string
+  credits_used?: number
+  credits_plan?: number
+  resets?: string
+  // codex window shape
+  provider?: string
+  plan_type?: string
+  primary?: RawCodexWindow | null
+  secondary?: RawCodexWindow | null
+  credits?: RawCodexCredits | null
+  captured_at?: string
+}
+
+/** Map one codex window, preserving its independent nullability (a null window
+ *  is a window the account does not have, not a 0% one). */
+function mapCodexWindow(w: RawCodexWindow | null | undefined): CodexBillingWindow | null {
+  if (!w || typeof w !== 'object') return null
+  return {
+    usedPercent: typeof w.used_percent === 'number' ? w.used_percent : 0,
+    windowMinutes: typeof w.window_minutes === 'number' ? w.window_minutes : 0,
+    resetsAt: typeof w.resets_at === 'number' ? w.resets_at : null,
+  }
 }
 
 /** Raw provider-hook entry from /api/kiro-hooks. */
@@ -255,7 +303,37 @@ export class AcpAdapter implements ProviderAdapter {
   async fetchUsage(): Promise<NormalizedUsage> {
     const data = await api.kiroUsage()
     const s = data.sessions
-    const b = data.billing || {}
+    const b: RawBilling = data.billing || {}
+    // Codex (ChatGPT-subscription) hosts report percent-of-window usage rather
+    // than a credit plan, so they are mapped by `provider === 'codex'`, NOT by
+    // the presence of the `plan` key (they have none). The kiro branch below is
+    // preserved byte-for-byte.
+    let billing: NormalizedBilling | null
+    if (b.provider === 'codex') {
+      billing = {
+        provider: 'codex',
+        planType: b.plan_type || '',
+        primary: mapCodexWindow(b.primary),
+        secondary: mapCodexWindow(b.secondary),
+        credits: b.credits
+          ? {
+              hasCredits: !!b.credits.has_credits,
+              unlimited: !!b.credits.unlimited,
+              balance: b.credits.balance ?? '',
+            }
+          : null,
+        capturedAt: b.captured_at || '',
+      }
+    } else {
+      billing = b.plan ? {
+        plan: b.plan,
+        used: b.credits_used,
+        limit: b.credits_plan,
+        unit: 'credits',
+        resets: b.resets,
+        percentUsed: b.credits_plan ? Math.round((b.credits_used ?? 0) / b.credits_plan * 100) : undefined,
+      } : null
+    }
     return {
       sessions: {
         total: s.total_sessions,
@@ -270,14 +348,7 @@ export class AcpAdapter implements ProviderAdapter {
           toolCalls: d.tool_calls,
         })),
       },
-      billing: b.plan ? {
-        plan: b.plan,
-        used: b.credits_used,
-        limit: b.credits_plan,
-        unit: 'credits',
-        resets: b.resets,
-        percentUsed: b.credits_plan ? Math.round((b.credits_used ?? 0) / b.credits_plan * 100) : undefined,
-      } : null,
+      billing,
     }
   }
 
