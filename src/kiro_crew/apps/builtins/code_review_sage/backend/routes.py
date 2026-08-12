@@ -40,6 +40,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import hooks, model_registry
+from kiro_crew.acp.client import configured_acp_backend
 
 logger = logging.getLogger("kirocrew.app.code-review-sage")
 
@@ -1473,41 +1474,75 @@ async def _handle_repos(request: web.Request) -> web.Response:
 # exposes the full config (read), so this route is the WRITE path plus a focused
 # settings view that also enumerates available models, efforts, and namespaces.
 
-def _load_known_models() -> list[str]:
-    """Selectable models for the review-settings dropdown — the registry's
-    CANONICAL keys (e.g. ``opus-4.8-1m``), which are the wire/persisted format
-    the review worker consumes, NOT the provider ids from ``available_models``.
+# Which registry provider describes the models an ACP backend can serve, keyed by
+# the ``agent.acp_backend`` id ("" = kiro-cli). Backend ids and registry provider
+# names are separate namespaces, so the pairing is explicit. A backend absent here
+# has no registry-described models: codex serves its own subscription models, which
+# the registry does not enumerate, and it rejects the Anthropic canonical keys.
+_REGISTRY_PROVIDER_BY_BACKEND: dict[str, str] = {"": "claude_code"}
+
+
+def _load_known_models(backend: str) -> list[str]:
+    """Selectable models for the review-settings dropdown on ``backend`` — the
+    registry's CANONICAL keys (e.g. ``opus-4.8-1m``), which are the wire/persisted
+    format the review worker consumes, NOT the provider ids from ``available_models``.
 
     Provider ids carry a ``[1m]`` capability suffix (e.g.
     ``global.anthropic.claude-opus-4-8[1m]``); the brackets fail ``_valid_model``'s
-    safe-token check, so sourcing the dropdown from provider ids made every 1M
-    variant unselectable (the PUT 400'd and the dropdown snapped back — only the
-    bracket-free plain ids survived). Canonical keys are bracket-free tokens that
+    safe-token check, so sourcing the dropdown from provider ids makes every 1M
+    variant unselectable (the PUT 400s and the dropdown snaps back — only the
+    bracket-free plain ids survive). Canonical keys are bracket-free tokens that
     both pass validation AND match what ``review_pool`` writes into the worker's
-    cli.json overlay. Empty on failure; the UI still offers 'Default (agent config)'."""
+    cli.json overlay.
+
+    Empty for a backend with no registry entries and on failure; the UI still
+    offers 'Default (agent config)', which inherits the agent config's model and
+    therefore whatever the backend itself serves."""
+    provider = _REGISTRY_PROVIDER_BY_BACKEND.get(backend)
+    if not provider:
+        return []
     try:
-        return [row["model_name"] for row in model_registry.display_list("claude_code")]
+        return [row["model_name"] for row in model_registry.display_list(provider)]
     except Exception:  # pragma: no cover - defensive
         return []
 
 
-# Computed once at import (the registry is immutable after load). A module-level
-# constant so the settings validator and the /settings enumerator share one list.
-_KNOWN_MODELS: list[str] = _load_known_models()
+# The kiro-cli allowlist, resolved once at import (the registry is immutable after
+# load) and seeding the per-backend cache below.
+_KNOWN_MODELS: list[str] = _load_known_models("")
+
+# Allowlist per configured ACP backend. Cached by backend id rather than computed
+# once, because the backend is a config value the operator can change under a
+# running gateway; a single import-time list would keep offering Anthropic model
+# ids after a switch to codex, which rejects them.
+_KNOWN_MODELS_BY_BACKEND: dict[str, list[str]] = {"": _KNOWN_MODELS}
 
 
 def _known_models() -> list[str]:
-    """Back-compat accessor for the known-model allowlist (the constant above)."""
-    return _KNOWN_MODELS
+    """The known-model allowlist for the CURRENTLY configured ACP backend.
+
+    ``configured_acp_backend`` fails closed to "" (kiro-cli), so an unreadable
+    config keeps the kiro-cli list every existing caller already handles."""
+    backend = configured_acp_backend()
+    cached = _KNOWN_MODELS_BY_BACKEND.get(backend)
+    if cached is None:
+        cached = _load_known_models(backend)
+        _KNOWN_MODELS_BY_BACKEND[backend] = cached
+    return cached
 
 
 def _valid_model(m: str) -> bool:
     """A model id is acceptable if it is a safe token (it becomes a cli.json
-    overlay key for the worker subprocess) and, when the registry is available,
-    is one it knows."""
+    overlay key for the worker subprocess) and, when the registry describes the
+    configured backend, is one it knows.
+
+    With no known list (a backend the registry does not enumerate, e.g. codex) any
+    safe token passes: the backend is the only authority on its own model ids, and
+    it rejects an invalid pick itself. The safe-token check is the security-relevant
+    half and applies unconditionally."""
     if not m or len(m) > 64 or not all(c.isalnum() or c in "._-" for c in m):
         return False
-    known = _KNOWN_MODELS
+    known = _known_models()
     return (m in known) if known else True
 
 
