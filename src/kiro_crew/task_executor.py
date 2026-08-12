@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import git_coord, platform_compat, shutdown_event
 from kiro_crew.acp.client import AcpProcessDied
-from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, fire_tool_hooks, get_global_hook_store
 from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
@@ -30,6 +29,7 @@ from kiro_crew.safety_override import safety_override
 from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session_map import configured_provider_label
 from kiro_crew.task_models import (
     MAX_RECOVERIES,
     MAX_RETRIES,
@@ -335,7 +335,7 @@ async def execute_task(
                     is_new,
                     session_key,
                     agent=agent or None,
-                    provider_type=KiroCrewConfig.load().agent.provider,
+                    provider_type=configured_provider_label(),
                 )
             else:
                 full_prompt = task_prompt
@@ -541,7 +541,6 @@ async def execute_task(
                     read_effective_agent,
                 )
 
-                _usage_cfg = KiroCrewConfig.load()
                 _used, _window = read_context_tokens(client)
                 await persist_token_record_async(
                     session_key,
@@ -551,7 +550,7 @@ async def execute_task(
                     # global default instead of what actually ran.
                     "",
                     _complete_event,
-                    provider=_usage_cfg.agent.provider,
+                    provider=configured_provider_label(),
                     surface=telemetry_channel_of(session_key),
                     agent=read_effective_agent(client) or agent or "",
                     context_used=_used,
@@ -880,14 +879,13 @@ async def self_review(
                 read_effective_agent,
             )
 
-            _rv_cfg = KiroCrewConfig.load()
             _used, _window = read_context_tokens(client)
             await persist_token_record_async(
                 review_key,
                 # Blank — see the task site above; model_source reports what ran.
                 "",
                 provider_last_turn_usage(client),
-                provider=_rv_cfg.agent.provider,
+                provider=configured_provider_label(),
                 surface=telemetry_channel_of(review_key),
                 agent=read_effective_agent(client) or agent or "",
                 context_used=_used,

@@ -78,8 +78,7 @@ async def test_hook_auto_approve_bypasses_interactive_prompt(tmp_path):
     sessions = _mock_sessions(provider)
     run, task = _run_and_task()
     ctx = _ctx_with_hook_action(TOOL_AUTO_APPROVE)
-    with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
-        cfg.return_value.agent.provider = "acp"
+    with patch.object(task_executor, "configured_provider_label", return_value="acp"):
         await task_executor.execute_task(
             run=run, task=task, sessions=sessions, ctx=ctx, agent="",
             on_tool_approval=prompt, auto_test=False, test_cmd=None,
@@ -96,8 +95,7 @@ async def test_headless_no_authorization_rejects(tmp_path):
     sessions = _mock_sessions(provider)
     run, task = _run_and_task()
     ctx = _ctx_with_hook_action(TOOL_ALLOW)
-    with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
-        cfg.return_value.agent.provider = "acp"
+    with patch.object(task_executor, "configured_provider_label", return_value="acp"):
         await task_executor.execute_task(
             run=run, task=task, sessions=sessions, ctx=ctx, agent="",
             on_tool_approval=None, auto_test=False, test_cmd=None,
@@ -115,8 +113,7 @@ async def test_headless_hook_auto_approve_still_approves(tmp_path):
     sessions = _mock_sessions(provider)
     run, task = _run_and_task()
     ctx = _ctx_with_hook_action(TOOL_AUTO_APPROVE)
-    with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
-        cfg.return_value.agent.provider = "acp"
+    with patch.object(task_executor, "configured_provider_label", return_value="acp"):
         await task_executor.execute_task(
             run=run, task=task, sessions=sessions, ctx=ctx, agent="",
             on_tool_approval=None, auto_test=False, test_cmd=None,
@@ -134,8 +131,7 @@ async def test_interactive_prompt_fires_when_handler_present(tmp_path):
     sessions = _mock_sessions(provider)
     run, task = _run_and_task()
     ctx = _ctx_with_hook_action(TOOL_ALLOW)
-    with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
-        cfg.return_value.agent.provider = "acp"
+    with patch.object(task_executor, "configured_provider_label", return_value="acp"):
         await task_executor.execute_task(
             run=run, task=task, sessions=sessions, ctx=ctx, agent="",
             on_tool_approval=prompt, auto_test=False, test_cmd=None,

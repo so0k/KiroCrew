@@ -18,9 +18,13 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 
 try:
-    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.acp.client import AcpClient, configured_acp_backend
 except ImportError:
     AcpClient = None  # type: ignore[assignment,misc]
+
+    def configured_acp_backend() -> str:  # type: ignore[misc]
+        return ""
+
 
 # Sweep-protection shield for AcpClient-backed workers. These are direct,
 # long-lived AcpClient sessions (not SessionMap sessions / warm-pool providers),
@@ -258,9 +262,19 @@ class AcpWorker(Worker):
             if self._sandbox_mode is not None
             else await asyncio.to_thread(_get_sandbox_mode)
         )
-        logger.info("AcpWorker: starting with agent=%s", AGENT_NAME)
+        # Resolved at start() time (not import time) so a respawn always picks up
+        # the operator's current agent.acp_backend rather than the value in effect
+        # when the pool was constructed. Without this, AcpClient always defaults
+        # to the kiro-cli dialect, which doesn't exist on a codex-only host.
+        acp_backend = await asyncio.to_thread(configured_acp_backend)
+        logger.info(
+            "AcpWorker: starting with agent=%s, acp_backend=%s", AGENT_NAME, acp_backend or "kiro"
+        )
         self._client = AcpClient(
-            agent=AGENT_NAME, sandbox_mode=sandbox_mode, audit_source="subagent"
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            audit_source="subagent",
+            acp_backend=acp_backend,
         )
         await self._client.ensure_ready()
         # Shield the live worker PID from the periodic orphan sweep for as long

@@ -184,12 +184,30 @@ def _pid_file_lock():  # type: ignore[no-untyped-def]
             yield
 
 
-# Basenames of agent runtimes whose lifecycle Kiro Crew manages through PID-file
-# tracking (kiro_pids.txt / kiro_session_pids.txt). Used to re-validate tracked
-# PIDs before a kill, and as a NEGATIVE gate in the work-orphan sweep: these
-# runtimes are reclaimed by their own tracked-PID sweep, never by the
-# marker-based work sweep (see _is_sweepable_orphan_work).
-_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude")
+# Markers identifying agent runtimes whose lifecycle Kiro Crew manages through
+# PID-file tracking (kiro_pids.txt / kiro_session_pids.txt). Used to re-validate
+# tracked PIDs before a kill (_is_managed_agent_process → platform_compat.
+# process_matches, which matches against the FULL cmdline/command on
+# Linux/macOS, or the exe image name on Windows), and as a NEGATIVE gate in the
+# work-orphan sweep's basename check (see _is_sweepable_orphan_work, which
+# matches only argv[0]'s basename).
+#
+# "codex" covers the codex-acp adapter (_resolve_codex_acp_argv in acp/client.py)
+# across its three spawn shapes:
+#   - a standalone `codex-acp` executable, or the `codex` CLI's `acp`
+#     subcommand: argv[0] IS the binary, so both the full-cmdline match
+#     (process_matches) AND the argv[0]-basename match (_work_orphan_basename)
+#     see "codex(-acp)" directly.
+#   - CODEX_ACP_BIN pointing at a non-executable script: wrapped as
+#     `[node, script_path]`. The script path still contains "codex-acp", so the
+#     full-cmdline match (process_matches) still matches — but argv[0] is
+#     `node`, so the work-sweep's argv[0]-basename check does NOT see "codex"
+#     for this shape. That basename check only gates a narrow, already-guarded
+#     path (a test-runner-shaped cmdline that also carries the KIROCREW_SPAWNED
+#     marker — see _is_sweepable_orphan_work), never the pre-kill re-validation
+#     that protects a live codex-acp process, so this gap does not leave a
+#     node-wrapped codex-acp adapter unprotected.
+_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude", "codex")
 
 
 def _is_managed_agent_process(pid: int) -> bool:

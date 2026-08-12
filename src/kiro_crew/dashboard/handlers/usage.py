@@ -17,6 +17,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import model_registry
+from kiro_crew.acp.client import configured_acp_backend
 from kiro_crew.acp.types import TurnUsage
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.context_blocks import USER_LABEL
@@ -1494,10 +1495,155 @@ def _parse_token_history() -> dict[str, Any]:
     return result
 
 
+def _sessions_from_own_records() -> dict:
+    """Build the SAME shape as :func:`_parse_sessions` from Kiro Crew's own
+    per-turn token-usage shards, for a host where kiro-cli's transcript
+    directory does not exist because a non-kiro ACP backend served every
+    turn (currently ``codex``; codex-acp keeps no session transcripts of its
+    own, so the kiro-path parse never has anything to read there).
+
+    Source: the same ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` shards
+    ``persist_token_record``/``persist_token_record_async`` already write on
+    EVERY backend from ``chat_runner``'s end-of-turn handler — this is the one
+    backend-agnostic record of activity Kiro Crew itself owns, so the dashboard
+    Usage tab renders the same way regardless of which ACP backend ran the
+    turns, instead of crashing on a masked-in-the-frontend special case.
+
+    The mapping is an approximation, not a byte-for-byte replay of the
+    kiro-path semantics (which reads kiro-cli's own per-session JSONL
+    transcripts):
+
+    - A "session" is a distinct dashboard slot key seen in a shard row.
+      Attributed to the day of its EARLIEST turn in the scanned window, the
+      same way the kiro path buckets a whole session file under the day of
+      its first message — so one long-lived session is counted once, not
+      once per day it happened to be active.
+    - "messages" is the count of completed-turn shard rows for that session
+      (one row per assistant turn completion). This under-counts against the
+      kiro path, which also counts the paired user Prompt entry per turn —
+      the shard only records the turn-completion event, never the outbound
+      prompt as its own row.
+    - "tool_calls" is always 0. The shard row carries token/cost/context
+      fields per turn, not a per-turn tool-invocation count, and the one
+      place Kiro Crew records tool names (``ConversationLog`` message
+      ``tools`` lists) is not indexed by day — counting it here would mean
+      an unbounded full-transcript scan on every poll. Genuinely unavailable
+      from Kiro Crew's own records at an acceptable cost, so it is reported
+      as 0 (a real count, not an error) rather than guessed.
+
+    Scoped to the same window ``_parse_token_history`` uses
+    (``_TOKEN_HISTORY_DAYS``, 30 days) since shards are day-partitioned and
+    that is the cheap thing to list. ``all_time_sessions`` reuses the SAME
+    window-scoped distinct-slot count: unlike kiro-cli's one-file-per-session
+    layout (where an unbounded ``all_time_sessions`` is a cheap stat() per
+    file), a token shard is one file per DAY holding every session's turns,
+    so an unbounded distinct-slot count would require parsing every shard
+    ever written. That is the same window-vs-unbounded trade-off
+    ``_parse_token_history`` already makes.
+    """
+    shard_paths = _shards_in_window(_TOKEN_HISTORY_DAYS)
+
+    # slot -> {"min_ts": epoch of its earliest turn in window, "turns": count}
+    slots: dict[str, dict[str, float]] = {}
+    for shard_path in shard_paths:
+        try:
+            with shard_path.open() as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                        continue
+                    slot = str(obj.get("slot") or "")
+                    if not slot:
+                        continue
+                    ts_raw = str(obj.get("ts") or "")
+                    try:
+                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
+                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    entry = slots.setdefault(slot, {"min_ts": ts_epoch, "turns": 0.0})
+                    if ts_epoch < entry["min_ts"]:
+                        entry["min_ts"] = ts_epoch
+                    entry["turns"] += 1
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    daily: Counter = Counter()
+    daily_msgs: Counter = Counter()
+    total_sessions = 0
+    total_msgs = 0
+
+    for entry in slots.values():
+        day = datetime.fromtimestamp(entry["min_ts"]).astimezone().strftime("%Y-%m-%d")
+        turns = int(entry["turns"])
+        daily[day] += 1
+        daily_msgs[day] += turns
+        total_sessions += 1
+        total_msgs += turns
+
+    all_days = sorted(daily.keys())
+    history = [
+        {"date": d, "sessions": daily[d], "messages": daily_msgs[d], "tool_calls": 0}
+        for d in all_days
+    ]
+
+    now_dt = datetime.now()
+    today_str = now_dt.strftime("%Y-%m-%d")
+    week_start = (now_dt - timedelta(days=now_dt.weekday())).strftime("%Y-%m-%d")
+    month_start = now_dt.strftime("%Y-%m-01")
+
+    today = [h for h in history if h["date"] == today_str]
+    week = [h for h in history if h["date"] >= week_start]
+    month = [h for h in history if h["date"] >= month_start]
+
+    return {
+        "total_sessions": total_sessions,
+        "total_messages": total_msgs,
+        "total_tool_calls": 0,
+        "all_time_sessions": total_sessions,
+        "daily_history": history,
+        "today": {
+            "sessions": sum(h["sessions"] for h in today),
+            "messages": sum(h["messages"] for h in today),
+            "tool_calls": 0,
+        },
+        "this_week": {
+            "sessions": sum(h["sessions"] for h in week),
+            "messages": sum(h["messages"] for h in week),
+            "tool_calls": 0,
+        },
+        "this_month": {
+            "sessions": sum(h["sessions"] for h in month),
+            "messages": sum(h["messages"] for h in month),
+            "tool_calls": 0,
+        },
+        "avg_msgs_per_session": round(total_msgs / max(total_sessions, 1), 1),
+        "avg_tools_per_session": 0.0,
+    }
+
+
 def _parse_sessions() -> dict:
-    """Parse local kiro session files for usage analytics."""
+    """Parse local kiro session files for usage analytics.
+
+    Falls back to :func:`_sessions_from_own_records` when kiro-cli's own
+    transcript directory does not exist AND the configured ACP backend is not
+    kiro-cli (``configured_acp_backend()`` non-empty, currently only
+    ``"codex"``) — codex-acp keeps no session transcripts of its own, so
+    returning the kiro-path error here would mean the Usage tab never renders
+    on a codex-only host; the frontend must not special-case this, so the
+    backend serves the same shape from its own records instead. A missing
+    directory while still on the kiro-cli backend keeps the existing error
+    contract unchanged: kiro-cli simply has not written a session yet (or
+    ``KIROCREW_HOME`` points somewhere unexpected), both worth surfacing
+    rather than silently backfilling with a lower-fidelity source.
+    """
     sessions_dir = _sessions_dir()
     if not sessions_dir.exists():
+        if configured_acp_backend():
+            return _sessions_from_own_records()
         return {"error": "No sessions directory"}
 
     cutoff = time.time() - (30 * 86400)
@@ -1622,8 +1768,14 @@ async def _cached_parse_sessions() -> dict:
 
     Both usage endpoints call this so neither blocks the aiohttp loop on the
     iterdir + per-file stat + json.loads scan, and a burst of polls reuses one
-    parse. Returns {} when there is no sessions directory (the common case for
-    claude_code/bedrock, where ~/.kiro/sessions/cli is kiro-cli's own store).
+    parse. Returns {} when there is no sessions directory AND the configured
+    ACP backend is kiro-cli (``configured_acp_backend() == ""``) — the common
+    case is a kiro-cli host that has not written a session yet, where {} is a
+    cheaper equivalent to _parse_sessions()'s error result (both are "no
+    data", and neither is cached). A non-kiro backend (currently ``codex``)
+    falls through to the executor path below instead, so this agrees with
+    _parse_sessions()'s own fallback to :func:`_sessions_from_own_records`
+    rather than masking a codex host's real activity behind {}.
     """
     global _SESSIONS_CACHE, _SESSIONS_CACHE_TS
     now = time.time()
@@ -1631,7 +1783,7 @@ async def _cached_parse_sessions() -> dict:
     # `is not None` (not truthiness) so a valid-but-empty {} parse is still a hit.
     if now - _SESSIONS_CACHE_TS < _CACHE_TTL and _SESSIONS_CACHE is not None:
         return _SESSIONS_CACHE
-    if not _sessions_dir().exists():
+    if not _sessions_dir().exists() and not configured_acp_backend():
         return {}
     async with _SESSIONS_CACHE_LOCK:
         # Re-check: a concurrent request may have refreshed while we waited, so
@@ -1680,7 +1832,14 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
         loop = asyncio.get_running_loop()
         sessions = await loop.run_in_executor(None, _parse_sessions)
 
-        # Get billing from existing usage cache
+        # Get billing from existing usage cache. get_usage_cache() is populated
+        # only by the kiro-cli credit-plan scrape/RTS lookup (sessions.py), so
+        # this stays {} on a codex host through the same "no credits_plan
+        # parsed" branch below — codex-acp does not yet forward the
+        # ChatGPT-subscription rate-limit/usage data upstream, so there is no
+        # billing source to surface there. {} is the correct answer, not a
+        # gap: it matches how any kiro-cli host with no parsed credit plan
+        # already renders, while sessions above still carries real activity.
         billing: dict = {}
         usage = get_usage_cache()
         # Only surface billing when a real credit plan parsed. The cache can hold

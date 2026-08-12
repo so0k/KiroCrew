@@ -36,6 +36,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.session_map import _SDK_MANAGED_PROVIDERS as _SPEC_ADAPTER_PROVIDER_TYPES
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.skills import SkillsLoader
 
@@ -45,6 +46,15 @@ if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
 
 logger = logging.getLogger(__name__)
+
+# ``provider_type`` values for the public-ACP-spec backends (claude-agent-acp,
+# codex-acp) that run with no kiro-cli process at all. kiro-cli natively loads
+# an agent's ``resources`` (steering + mapped ``skill://`` globs) when spawned
+# with ``--agent`` (acp/client.py ``_spawn``); neither spec adapter reads
+# ``resources``, so this module must inject that content itself for both. Same
+# backend set as ``session_map._SDK_MANAGED_PROVIDERS`` (imported above under
+# this name), which groups them for a different reason — their transcripts
+# live in the adapter's own SDK store rather than the kiro-cli sessions dir.
 
 # Lazy cache of MemoryStore instances keyed by workspace name.
 _memory_stores: dict[str, MemoryStore] = {}
@@ -1330,14 +1340,14 @@ def build_session_replay(
     return replay.translate(_MULTIBYTE_TABLE)
 
 
-def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, list[str]]:
+def _skills_injection_plan(agent: str | None, *, is_spec_adapter: bool) -> tuple[bool, list[str]]:
     """Whether to inject skills for *agent*, plus the glob restriction to apply.
 
     THE single source of truth for the agent-scoping rule, shared by the
     session-start injection and the post-compaction re-injection. Mapped agents
-    (a ``skill://`` resource in their agent JSON) are Claude-Code-only, since
-    kiro loads those natively; an unmapped agent gets skills only when it is the
-    default one.
+    (a ``skill://`` resource in their agent JSON) are spec-adapter-only (Claude
+    Code, Codex), since kiro-cli loads those natively; an unmapped agent gets
+    skills only when it is the default one.
 
     Deliberately one function rather than the same expression written twice: a
     hand-copied second gate is exactly what let the re-injection path ship
@@ -1345,7 +1355,7 @@ def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, lis
     """
     globs = agent_skill_globs(agent) if agent else []
     is_custom = bool(agent) and agent != "kirocrew"
-    return (is_cc if globs else not is_custom), globs
+    return (is_spec_adapter if globs else not is_custom), globs
 
 
 class ContextBuilder:
@@ -1467,12 +1477,12 @@ class ContextBuilder:
                 "critical point.\n"
                 "- Supporting bullets only if the reader would be STUCK without "
                 "them. Max 3. Each bullet is one short sentence.\n"
-                "- Take a position. Name your pick. Resolve \"it depends\" "
+                '- Take a position. Name your pick. Resolve "it depends" '
                 "immediately.\n"
                 "- Do NOT add: tables, headers, numbered lists > 3 items, "
-                "\"common pitfalls\", \"also consider\", multi-section layouts, "
-                "or any content that fails the test: \"would the reader be "
-                "stuck without this line?\"\n"
+                '"common pitfalls", "also consider", multi-section layouts, '
+                'or any content that fails the test: "would the reader be '
+                'stuck without this line?"\n'
                 "- Code blocks and commands are the answer — never cut them.\n"
                 "- Never compress for brevity: security warnings, "
                 "irreversible-action confirmations, and ordered multi-step "
@@ -1624,21 +1634,23 @@ class ContextBuilder:
         deployment's effective window), leaving that path byte-for-byte
         unchanged.
 
-        All providers — including ``provider_type="claude_code"`` — receive the
-        same injected context (critical rules, thread history, memory, skills,
+        All providers — including the spec-adapter backends
+        (``provider_type`` in ``claude_code``/``codex``) — receive the same
+        injected context (critical rules, thread history, memory, skills,
         lessons); steering files are the one exception (see below). This keeps
-        Claude Code at parity with kiro so dashboard/Slack UI contracts (diff
-        blocks, OPTIONS buttons, file links) and prior conversation context
-        behave identically across providers.
+        Claude Code and Codex at parity with kiro so dashboard/Slack UI
+        contracts (diff blocks, OPTIONS buttons, file links) and prior
+        conversation context behave identically across providers.
 
         *provider_type* is consumed again for the steering gate only: the
-        steering block below is injected solely on the CC backend
-        (``provider_type == "claude_code"``). kiro-cli loads an agent's
-        ``resources`` natively when spawned with ``--agent`` (acp/client.py
-        ``_spawn``), so re-injecting steering on the ACP/kiro backend would
-        duplicate what kiro already loaded; the CC backend (claude-agent-acp)
-        does NOT read agent ``resources`` and still needs the explicit load.
-        Everything else stays at CC/ACP parity.
+        steering block below is injected solely on a spec-adapter backend
+        (``provider_type in ("claude_code", "codex")``). kiro-cli loads an
+        agent's ``resources`` natively when spawned with ``--agent``
+        (acp/client.py ``_spawn``), so re-injecting steering on the ACP/kiro
+        backend would duplicate what kiro already loaded; neither spec adapter
+        (claude-agent-acp, codex-acp) reads agent ``resources``, so both still
+        need the explicit load. Everything else stays at spec-adapter/ACP
+        parity.
 
         *context_groups* selects which switchable groups are injected (see
         ``SWITCHABLE_CONTEXT_GROUPS``). ``None`` — every caller except a
@@ -1654,7 +1666,7 @@ class ContextBuilder:
         lessons, critical rules, and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
-        is_cc = provider_type == "claude_code"
+        is_spec_adapter = provider_type in _SPEC_ADAPTER_PROVIDER_TYPES
         caps = _resolve_caps(model_window)
         parts: list[str] = []
 
@@ -1787,11 +1799,15 @@ class ContextBuilder:
         # Steering files from agent config resources.
         # kiro-cli loads an agent's ``resources`` natively when spawned with
         # ``--agent`` (see acp/client.py ``_spawn``) — the same mechanism that
-        # lets us skip this for custom agents above. The CC backend
-        # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
-        # the explicit load. Injecting on the ACP/kiro backend would duplicate
-        # what kiro-cli already loaded.
-        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
+        # lets us skip this for custom agents above. Neither spec-adapter
+        # backend (claude-agent-acp, codex-acp) reads agent ``resources``, so
+        # only those need the explicit load. Injecting on the ACP/kiro backend
+        # would duplicate what kiro-cli already loaded.
+        if (
+            not is_custom
+            and is_spec_adapter
+            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
+        ):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -1898,9 +1914,10 @@ class ContextBuilder:
         #    ACP/kiro backend kiro-cli loads those SKILL.md files ITSELF when
         #    spawned with ``--agent`` (acp/client.py ``_spawn``), so injecting
         #    them again here would duplicate every mapped skill's content —
-        #    exactly the reason the steering block below is CC-only. On the CC
-        #    backend (claude-agent-acp) nothing reads agent ``resources``, so
-        #    KiroCrew injects the mapped set itself, scoped by ``only=``.
+        #    exactly the reason the steering block above is spec-adapter-only.
+        #    Neither spec adapter (claude-agent-acp, codex-acp) reads agent
+        #    ``resources``, so Kiro Crew injects the mapped set itself for both,
+        #    scoped by ``only=``.
         # 2. No mapping + the kirocrew agent -> the whole catalog (unchanged).
         # 3. No mapping + a custom agent -> nothing (unchanged; the agent is
         #    expected to bring its own via kiro-cli).
@@ -1909,9 +1926,10 @@ class ContextBuilder:
         # on-demand skills (plus always:true pinned) and leave the tail to
         # skill_search, keeping the block bounded instead of dumping every
         # skill's summary. The slice below is a defensive backstop only.
-        # Mapped: CC only (kiro loads them natively). Unmapped: kirocrew only.
-        # Shared with the post-compaction re-injection in build_message.
-        inject_skills, skill_globs = _skills_injection_plan(agent, is_cc=is_cc)
+        # Mapped: spec adapters only (kiro loads them natively). Unmapped:
+        # kirocrew only. Shared with the post-compaction re-injection in
+        # build_message.
+        inject_skills, skill_globs = _skills_injection_plan(agent, is_spec_adapter=is_spec_adapter)
         if inject_skills:
             # ON: usage-ranked top-K bounded by the skills section cap.
             # OFF (budget=None): legacy full skills dump, unchanged behavior.
@@ -2077,7 +2095,12 @@ class ContextBuilder:
         # Set together with the user's text part when user_text_range is given.
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
+        # Gates the persona-prompt branding rewrite just below: that rewrite
+        # hardcodes Claude-Code-specific wording ("claude code"/"Claude"), so
+        # it stays keyed to the claude seam specifically rather than widened
+        # to every spec adapter. See ``is_spec_adapter`` for the skills gate.
         is_cc = provider_type == "claude_code"
+        is_spec_adapter = provider_type in _SPEC_ADAPTER_PROVIDER_TYPES
 
         # Session context on first message only
         if is_new_session:
@@ -2189,7 +2212,7 @@ class ContextBuilder:
         # mapping excludes and an unmapped custom agent cannot receive a block
         # its session-start context never contained.
         if not is_new_session and needs_reinjection:
-            _inject, _globs = _skills_injection_plan(agent, is_cc=is_cc)
+            _inject, _globs = _skills_injection_plan(agent, is_spec_adapter=is_spec_adapter)
             if _inject:
                 _cfg = KiroCrewConfig.load()
                 lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))

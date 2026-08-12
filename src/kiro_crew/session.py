@@ -1122,12 +1122,19 @@ class SessionManager:
         (``acp``) backend — the only backend the multiplexed ``AcpRuntime``
         supports. For non-kiro backends ``_bg`` falls back to the provider-backed
         ``_Session`` path serialized by ``Semaphore(1)``.
+
+        The dialect switch is ``agent.acp_backend`` (``""`` = kiro-cli), NOT
+        ``agent.provider`` — the latter is a fixed enum whose only value is
+        ``"acp"``, so reading it would always report kiro and route codex's
+        background one-liners (chat titles, suggestions, tips, the picker's
+        background model resolution) through the kiro-only ``AcpRuntime``, which
+        raises on a codex-only host with no kiro-cli binary.
         """
         try:
-            prov = getattr(self._cfg.agent, "provider", "acp") or "acp"
+            backend = getattr(self._cfg.agent, "acp_backend", "") or ""
         except Exception:
-            prov = "acp"
-        return prov == "acp"
+            backend = ""
+        return not backend
 
     async def get_bg_session(self) -> "AcpSessionHandle | _ProviderBgSession":
         """Acquire a ``_bg`` session handle, dispatching by provider backend.

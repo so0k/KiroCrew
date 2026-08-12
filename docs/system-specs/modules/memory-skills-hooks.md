@@ -1251,9 +1251,9 @@ A spawning parent decides which of three groups its sub-agent inherits, via `inc
 | conduct | `_CRITICAL_RULES`, `[CURRENT DATE]`, agent identity + `[RUNTIME]`, UI language, `[WORKSPACE IDENTITY]`, skills index | no |
 | `memory` | preferences, projects, `## Recent History`, `[Semantic Memory]`, `[Episodic Memory]`, `## Recent Session Context` | yes |
 | `lessons` | `[Learned corrections]` (global + workspace), `[USER PROFILE]` | yes |
-| `project` | `[DOCUMENTATION]` pointer, steering resources (CC backend only), `[PROJECT]` directory line | yes |
+| `project` | `[DOCUMENTATION]` pointer, steering resources (spec-adapter backends only), `[PROJECT]` directory line | yes |
 
-The steering row carries a backend caveat: the steering block is injected only on the Claude Code backend (`is_cc`), because on the ACP/kiro backend `kiro-cli --agent` loads the agent's own `resources` natively. `include_project=false` therefore suppresses steering on CC only — an ACP sub-agent still receives it, and nothing in Kiro Crew can prevent that from this call site.
+The steering row carries a backend caveat: the steering block is injected only on a spec-adapter backend — Claude Code or Codex (`is_spec_adapter`, `provider_type in ("claude_code", "codex")`) — because on the ACP/kiro backend `kiro-cli --agent` loads the agent's own `resources` natively. `include_project=false` therefore suppresses steering on the spec-adapter backends only — an ACP sub-agent still receives it, and nothing in Kiro Crew can prevent that from this call site.
 
 conduct is not switchable because every member is an output contract or a capability pointer: a sub-agent without the skills index cannot discover what it can do, and one without `_CRITICAL_RULES` cannot format what it reports back.
 

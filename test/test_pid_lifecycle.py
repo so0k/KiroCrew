@@ -961,7 +961,7 @@ class TestLinuxPidAge:
 
 class TestIsManagedAgentProcess:
     def test_self_pid_not_managed(self) -> None:
-        """Our own test PID's cmdline lacks kiro-cli/claude → not managed.
+        """Our own test PID's cmdline lacks kiro-cli/claude/codex → not managed.
 
         Exercises the platform_compat.process_matches call (the real
         /proc/<pid>/cmdline read on Linux) without killing anything.
@@ -969,6 +969,41 @@ class TestIsManagedAgentProcess:
         from kiro_crew.session_pid import _is_managed_agent_process
 
         assert _is_managed_agent_process(os.getpid()) is False
+
+    def test_codex_acp_cmdline_matches_the_codex_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A node-wrapped codex-acp adapter is recognized as managed.
+
+        codex-acp's npm distribution shebang-wraps a JS entry point, so the
+        OS rewrites argv[0] to the node interpreter — but the full command
+        line (what ``process_matches`` scans on Linux/macOS) still contains
+        the "codex-acp" script path, so the "codex" marker matches the
+        pre-kill re-validation path even though argv[0] is not "codex".
+        """
+        monkeypatch.setattr(platform_compat.sys, "platform", "darwin")
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda _n: "/bin/ps")
+        monkeypatch.setattr(
+            platform_compat.subprocess,
+            "check_output",
+            lambda *_a, **_k: b"node /usr/local/lib/node_modules/codex-acp/bin/codex-acp.js",
+        )
+        from kiro_crew.session_pid import _is_managed_agent_process
+
+        assert _is_managed_agent_process(4242) is True
+
+    def test_unrelated_process_does_not_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unrelated process (e.g. a stray ``vim``) is never treated as managed."""
+        monkeypatch.setattr(platform_compat.sys, "platform", "darwin")
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda _n: "/bin/ps")
+        monkeypatch.setattr(
+            platform_compat.subprocess,
+            "check_output",
+            lambda *_a, **_k: b"vim /tmp/notes.txt",
+        )
+        from kiro_crew.session_pid import _is_managed_agent_process
+
+        assert _is_managed_agent_process(4242) is False
 
 
 class TestSyncKillProvider:

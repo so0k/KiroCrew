@@ -153,6 +153,36 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
 
 Custom agents use cold start with `--agent <name>` flag at spawn time.
 
+**Spec adapters cannot apply a custom agent's `tools` allowlist at all** — no
+`set_mode`, no `--agent`-driven config read (see "Backend Selection" above).
+For the default `kirocrew` agent this is already covered: its persona, model,
+and MCP servers are delivered by other mechanisms (`context.py` injection,
+`_apply_startup_model`, `_codex_session_mcp_servers`/`_claude_acp_mcp_servers`),
+and Kiro Crew's own governance ceiling + denied-command floor apply at the
+hooks gate regardless of backend (governance.md). But a non-default agent
+whose `~/.kiro/agents/<agent>.json` deliberately narrows `tools` — e.g. the
+shipped `auto-improvement-pr-author` (`"tools": []`, a prose-only agent with
+no shell access on kiro-cli) — has no equivalent on a spec adapter: the
+adapter's own built-in tools (shell included) are not gated by that file at
+all, so silently running the agent there would grant it shell access its
+kiro-cli config specifically withholds. `_spec_adapter_shell_restriction()`
+in `acp/client.py` checks the target agent's on-disk config for exactly this
+one verifiable case (`tools` present and missing `execute_bash`);
+`AcpClient._assert_spec_adapter_agent_permitted()` raises `AcpError` from it
+at the same handshake step kiro's `set_mode` guard occupies (`_initialize_session`,
+step 4), rather than silently degrading. It fires only on a positive finding — a
+missing/unparseable agent config, one with no `tools` key, or one that
+already lists `execute_bash`, is unaffected (matches today's behavior),
+which keeps this a narrow polyfill rather than a blanket ban on custom
+agents under `claude`/`codex`. Managed agents Kiro Crew itself authors
+(`agent_files.OWNED_KIRO_AGENT_FILES`: `kirocrew-lite`, `kirocrew-knowledge`,
+`kirocrew-research`, `kirocrew-heartbeat`) are exempt: their shell-less
+profiles are Kiro Crew's own scope/cost choice over prompts it authors itself,
+not an operator-imposed ceiling, and refusing them would brick the background
+session, knowledge extraction, and heartbeat on every spec-adapter host. The
+governance ceiling and denied-command floor still gate their tool calls at
+the hooks gate regardless of backend.
+
 ## Protocol Flow
 
 `initialize` → `session/load` or `session/new` → `set_mode` (conditional) → `set_model` (conditional) → drain notifications → `session/prompt`

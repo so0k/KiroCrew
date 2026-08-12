@@ -780,7 +780,10 @@ Windows as well as macOS/Linux. The critical correctness reason is that
 so every liveness check uses `platform_compat.pid_exists(pid)` (or the tri-state
 `pid_liveness`) instead, kills use `kill_pid` / `kill_process_tree`, the PID-reuse
 guard reads the parent via `get_ppid`, the managed-agent check uses
-`process_matches(pid, ("kiro-cli","claude"))`, and the PID-file locks use
+`process_matches(pid, ("kiro-cli","claude","codex"))` (the "codex" marker covers
+the codex-acp adapter; see `_MANAGED_AGENT_MARKERS` in `session_pid.py` for the
+per-spawn-shape coverage detail, including the node-wrapped-script gap in the
+work-sweep's argv[0]-basename check), and the PID-file locks use
 `platform_compat.file_lock` / `acquire_lock` / `try_acquire_lock` (POSIX `flock`
 vs Windows `msvcrt`). On POSIX the behavior is unchanged.
 

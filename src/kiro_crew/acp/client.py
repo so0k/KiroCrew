@@ -99,7 +99,8 @@ from kiro_crew.acp.types import (
     TurnUsage,
 )
 from kiro_crew.agent import ensure_agent_materialized
-from kiro_crew.config.paths import kiro_sessions_dir
+from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+from kiro_crew.config.paths import kiro_agents_dir, kiro_sessions_dir
 from kiro_crew.constants import (
     COMPACT_WAIT_TIMEOUT_SECS,
     KIROCREW_SPAWNED_ENV,
@@ -1893,6 +1894,59 @@ def _select_tool_title(title: object, raw_input: object) -> str | None:
     return None
 
 
+def _spec_adapter_shell_restriction(agent: str) -> str | None:
+    """Return why *agent* cannot be safely activated on a spec adapter, or None.
+
+    ``session/set_mode`` is the ONLY mechanism that applies a custom kiro
+    agent's ``tools`` allowlist (governance.md: the kiro agent config is out
+    of scope for Kiro Crew's own policy/profile ceiling, which does not
+    substitute for it). A spec adapter (claude, codex) never sends
+    ``set_mode`` and reads no kiro agent config at all, so an agent whose
+    ``~/.kiro/agents/<agent>.json`` deliberately omits ``execute_bash`` —
+    e.g. the shipped ``auto-improvement-pr-author`` (``"tools": []``), a
+    prose-only agent with no shell access on kiro-cli — would silently run
+    with the adapter's own unrestricted built-in shell tool instead, a
+    privilege escalation of exactly the kind the kiro-side ``set_mode``
+    guard (fail-closed on a missing mode, see the caller) exists to prevent.
+
+    Only a POSITIVE finding refuses: the default ``kirocrew`` agent, every
+    managed agent Kiro Crew itself authors (``agent_files.OWNED_KIRO_AGENT_FILES``),
+    and any agent whose config cannot be read/parsed, has no ``tools`` key,
+    or already lists ``execute_bash``, return ``None`` (unchanged behavior) —
+    this stays a narrow, verifiable check, not a blanket ban on custom agents
+    under a spec adapter.
+
+    Agents Kiro Crew itself authors are exempt because their shell-less profiles
+    (e.g. ``kirocrew-lite``, the cheap background agent behind auto-titles /
+    compaction / heartbeat) are Kiro Crew's own scope-and-cost choice over
+    prompts it authors itself, not an operator-imposed security ceiling —
+    refusing them would brick the background session, knowledge extraction,
+    and heartbeat on every spec-adapter host. The operator's real ceiling
+    (governance POLICY ∩ PROFILE plus denied commands at the hooks gate)
+    still applies to their tool calls regardless of backend.
+    """
+    if not agent or agent == CLIENT_NAME:
+        return None
+    if f"{agent}.json" in OWNED_KIRO_AGENT_FILES:
+        return None
+    try:
+        raw = (kiro_agents_dir() / f"{agent}.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tools = data.get("tools")
+    if not isinstance(tools, list):
+        return None
+    if "execute_bash" in tools:
+        return None
+    return (
+        f"~/.kiro/agents/{agent}.json omits execute_bash from its tools list "
+        "(a deliberate shell-access restriction)"
+    )
+
+
 class AcpClient:
     """JSON-RPC 2.0 client over stdio with kiro-cli acp."""
 
@@ -3198,6 +3252,40 @@ class AcpClient:
 
         return session_resp
 
+    def _assert_spec_adapter_agent_permitted(self) -> None:
+        """Fail-closed counterpart of the kiro ``set_mode`` guard, for spec adapters.
+
+        ``session/set_mode`` is the ONLY mechanism that applies a custom kiro
+        agent's ``tools`` allowlist (governance.md: the kiro agent config is
+        out of scope for Kiro Crew's own policy/profile ceiling, which does
+        not substitute for it). A spec adapter (claude, codex) never sends
+        ``set_mode`` and reads no kiro agent config at all, so an agent whose
+        ``~/.kiro/agents/<agent>.json`` deliberately omits ``execute_bash`` —
+        e.g. the shipped ``auto-improvement-pr-author`` (``"tools": []``), a
+        prose-only agent with no shell access on kiro-cli — would silently
+        run with the adapter's own unrestricted built-in shell tool instead:
+        a privilege escalation of exactly the kind the kiro-side guard
+        (fail-closed on a missing mode, in ``_initialize_session``) exists to
+        prevent.
+
+        Only a POSITIVE finding refuses: the default ``kirocrew`` agent and
+        any agent whose config cannot be read/parsed, has no ``tools`` key,
+        or already lists ``execute_bash``, are unaffected (unchanged
+        behavior) — this stays a narrow, verifiable check, not a blanket ban
+        on custom agents under a spec adapter.
+        """
+        restriction = _spec_adapter_shell_restriction(self._agent)
+        if not restriction:
+            return
+        raise AcpError(
+            f"Agent {self._agent!r} cannot be activated on the {self.backend!r} "
+            f"backend: {restriction}, but this backend has no session/set_mode "
+            "equivalent to enforce it — running the session here would silently "
+            "grant full shell access. Clear agent.acp_backend (use the default "
+            "kiro-cli backend) for this agent, or run it as the default kirocrew "
+            "agent."
+        )
+
     async def _initialize_session(self) -> None:
         """Handshake: initialize → session/load or session/new → set_mode → set_model."""
         # 1. Initialize
@@ -3354,6 +3442,12 @@ class AcpClient:
                     f"to run the backend default mode in its place. Run "
                     f"`kirocrew setup --agent-only` to materialize the agent config."
                 )
+        elif self._is_spec_adapter:
+            # No set_mode on this dialect, so a custom agent's tools allowlist
+            # is never applied natively — refuse the ones we can positively
+            # verify need it rather than silently granting the adapter's own
+            # unrestricted shell tool.
+            self._assert_spec_adapter_agent_permitted()
 
         # 5. Set model — override if KiroCrew config specifies non-default.
         await self._apply_startup_model()

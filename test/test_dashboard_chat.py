@@ -3829,6 +3829,48 @@ class TestTokenPersistenceBackfill:
         assert slot.model == "claude-opus-4.6"
 
 
+class TestEmptyUsagePersistGate:
+    """The persist gate skips a no-usage turn on kiro but keeps it on a spec
+    adapter: codex-acp forwards no per-turn token counts or credits, and the
+    Usage tab's own-records fallback counts sessions/messages from exactly
+    these rows on a codex host — dropping them would zero the Usage tab."""
+
+    @staticmethod
+    async def _run_empty_usage_turn(tmp_path, monkeypatch, label: str) -> list[tuple]:
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        events = [LLMEvent(kind=EVENT_COMPLETE, usage=TurnUsage())]
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = TestTokenPersistenceBackfill._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.configured_provider_label", lambda: label
+        )
+        captured: list[tuple] = []
+
+        async def _fake_persist(k, m, e, provider="", **kwargs):
+            captured.append((k, provider))
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.persist_token_record_async", _fake_persist
+        )
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_codex_turn_with_no_usage_still_persists(self, tmp_path, monkeypatch):
+        captured = await self._run_empty_usage_turn(tmp_path, monkeypatch, "codex")
+        assert captured == [("s1", "codex")]
+
+    @pytest.mark.asyncio
+    async def test_kiro_turn_with_no_usage_is_still_skipped(self, tmp_path, monkeypatch):
+        captured = await self._run_empty_usage_turn(tmp_path, monkeypatch, "acp")
+        assert captured == []
+
+
 class TestTokenUsageSurface:
     """Usage rows record the slot's effective session source."""
 

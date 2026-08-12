@@ -192,6 +192,7 @@ from kiro_crew.security import redact, redact_credentials, redact_exfiltration_u
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
 from kiro_crew.session import HEARTBEAT_KEY, SessionManager
+from kiro_crew.session_map import configured_provider_label
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.client import RealSlackClient
 from kiro_crew.slack.format import (
@@ -2501,7 +2502,11 @@ class GatewayOrchestrator:
                                 # model_source, which reports what actually ran.
                                 "" if _seq_downgraded else (job.model or ""),
                                 provider_last_turn_usage(client),
-                                provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                                provider=(
+                                    configured_provider_label()
+                                    if hasattr(self, "_cfg")
+                                    else "acp"
+                                ),
                                 surface="cron",
                                 agent=read_effective_agent(client) or agent or "",
                                 context_used=_used,
@@ -2572,7 +2577,7 @@ class GatewayOrchestrator:
                         "do NOT repeat the same content]\n"
                         + "\n".join(f"- {a}" for a in job.acked_items)
                     )
-                _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+                _provider = configured_provider_label() if hasattr(self, "_cfg") else "acp"
                 # Off-loop: build_message embeds the episodic query.
                 full_message, _ = await run_in_embed_pool(
                     self.ctx_builder.build_message,
@@ -3157,7 +3162,7 @@ class GatewayOrchestrator:
                 await _persist_turn_row(
                     client,
                     session_key,
-                    provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                    provider=(configured_provider_label() if hasattr(self, "_cfg") else "acp"),
                     surface="heartbeat",
                     agent_fallback=lambda: "kirocrew-heartbeat",
                     t0=_turn_t0,
@@ -3188,7 +3193,7 @@ class GatewayOrchestrator:
                 await _persist_turn_row(
                     client,
                     session_key,
-                    provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                    provider=(configured_provider_label() if hasattr(self, "_cfg") else "acp"),
                     surface="heartbeat",
                     agent_fallback=lambda: "kirocrew-heartbeat",
                     t0=_turn_t0,
@@ -3304,7 +3309,7 @@ class GatewayOrchestrator:
         try:
             client, is_new, _resumed = await self.sessions.get_or_create(key)
             _acquired = True
-            _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+            _provider = configured_provider_label() if hasattr(self, "_cfg") else "acp"
             full_msg, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message, tagged, is_new, key, provider_type=_provider
             )
@@ -3332,7 +3337,7 @@ class GatewayOrchestrator:
             await _persist_turn_row(
                 client,
                 key,
-                provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                provider=(configured_provider_label() if hasattr(self, "_cfg") else "acp"),
                 surface="monitor",
                 agent_fallback=lambda: _get_agent_for_session(key),
                 t0=_turn_t0,
@@ -3356,7 +3361,7 @@ class GatewayOrchestrator:
             await _persist_turn_row(
                 client,
                 key,
-                provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                provider=(configured_provider_label() if hasattr(self, "_cfg") else "acp"),
                 surface="monitor",
                 agent_fallback=lambda: _get_agent_for_session(key),
                 t0=_turn_t0,
@@ -4824,7 +4829,7 @@ class GatewayOrchestrator:
                         client, is_new, _resumed = await self.sessions.get_or_create(parent_key)
                         _acquired = True
                         _footer_client = client
-                        _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+                        _provider = configured_provider_label() if hasattr(self, "_cfg") else "acp"
                         if self.ctx_builder:
                             msg, _ = await run_in_embed_pool(
                                 self.ctx_builder.build_message,
@@ -5019,7 +5024,7 @@ class GatewayOrchestrator:
                 try:
                     client, is_new, _resumed = await self.sessions.get_or_create(parent_key)
                     acquired = True
-                    _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+                    _provider = configured_provider_label() if hasattr(self, "_cfg") else "acp"
                     if self.ctx_builder:
                         msg, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,

@@ -69,6 +69,7 @@ from kiro_crew.providers.base import (
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionManager
+from kiro_crew.session_map import configured_provider_label
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
@@ -4804,7 +4805,7 @@ class SubagentManager:
             message,
             is_new,
             session_key,
-            provider_type="claude_code" if is_cc else "acp",
+            provider_type="claude_code" if is_cc else configured_provider_label(),
             model_window=_sub_window,
             context_groups=_groups,
         )
@@ -4840,7 +4841,7 @@ class SubagentManager:
         # Record session_id and provider type for session file cleanup
         try:
             session_id = client.session_id if hasattr(client, "session_id") else ""
-            provider_type = "claude_code" if is_cc else "acp"
+            provider_type = "claude_code" if is_cc else configured_provider_label()
             state_update: dict[str, object] = {
                 "session_id": session_id,
                 "provider": provider_type,
@@ -5214,7 +5215,7 @@ class SubagentManager:
                 session_key,
                 info.model or "",
                 _complete_event,
-                provider="claude_code" if is_cc else "acp",
+                provider="claude_code" if is_cc else configured_provider_label(),
                 surface="subagent",
                 # Explicit/inherited `agent` FIRST here — unlike every other
                 # surface. Under session sharing this subagent reuses the

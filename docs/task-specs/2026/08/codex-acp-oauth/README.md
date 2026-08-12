@@ -182,3 +182,38 @@ Ride the seam; keep the diff minimal and rebase-friendly.
       - still TODO once authed: advertised config options (`model`, `effort`),
         `mcpServers` stdio shape acceptance, whether approval policy can be
         forced on the wire.
+
+## Polyfill round (post-audit)
+
+A claude-parity + subsystem audit adjudicated every codex-absent site; the
+gaps where Kiro Crew itself owns the interface were closed (each with tests and
+same-commit spec updates; validated live on kirocrew-vm over LAN):
+
+- **Session resume/prune** — `session_map` treats `"codex"` as SDK-managed
+  (`_SDK_MANAGED_PROVIDERS`), so codex mappings resume instead of being swept.
+- **Background one-liners + knowledge pool** — `_bg_provider_is_kiro` and
+  `AcpWorker.start()` read `agent.acp_backend`, so neither spawns kiro-cli on
+  a codex-only host.
+- **Provider labels end-to-end** — `session_map.configured_provider_label()`
+  replaces the pinned `cfg.agent.provider` at every `provider_type=`/usage-row
+  call site (slack gateway, chat_runner, task_executor, dashboard hooks,
+  subagent), so codex sessions reach context.py and telemetry as `"codex"`.
+- **Context/steering/skills parity** — context.py's `is_cc` gates widened to
+  `is_spec_adapter` (steering docs, mapped `skill://` globs, project group,
+  post-compaction re-injection); the persona branding rewrite stays claude-only.
+- **Usage analytics same-shape** — `/api/usage/kiro` falls back to
+  `_sessions_from_own_records()` (Kiro Crew's own token shards) on a non-kiro
+  backend instead of `{"error": "No sessions directory"}`; chat_runner's
+  persist gate keeps a completed spec-adapter turn even with zero
+  tokens/credits (codex-acp forwards neither per-turn), so the rows exist to
+  count. Billing stays `{}` until upstream forwards ChatGPT rate limits.
+- **Agent-profile fail-closed guard** — spec adapters never `set_mode`, so a
+  custom agent whose kiro config withholds `execute_bash` would silently gain
+  the adapter's own shell; `_assert_spec_adapter_agent_permitted()` refuses
+  exactly that case (agents Kiro Crew itself authors, `OWNED_KIRO_AGENT_FILES`, exempt —
+  their shell-less profiles are Kiro Crew's own scope choice, and refusing
+  `kirocrew-lite` bricked the background session on first live deploy).
+- **PID lifecycle** — `_MANAGED_AGENT_MARKERS` gains `"codex"` (full-cmdline
+  pre-kill re-validation covers all three codex-acp spawn shapes).
+- **Verified non-gaps** — `_model_rejected_reason` needs no codex exemption
+  (codex ids are never canonical registry keys; pinned by test).

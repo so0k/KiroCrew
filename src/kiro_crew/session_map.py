@@ -38,10 +38,44 @@ SESSION_MAP_FILENAME = "session_map.json"
 # issue #874; dashboard/handlers/usage.py is the reference implementation.
 _KIRO_SESSIONS_DIR: Path | None = None
 
+# Provider labels whose transcripts live in the backend adapter's own SDK store,
+# NOT in the kiro-cli sessions directory. A mapping for one of these is validated
+# by the adapter on resume, so it must never be pruned against the kiro dir (the
+# file will never be there). kiro-cli entries are labelled "acp" (or "" for
+# legacy rows); every other backend is SDK-managed.
+_SDK_MANAGED_PROVIDERS = frozenset({"claude_code", "codex"})
+
 
 def _kiro_sessions_dir() -> Path:
     """kiro-cli sessions directory, resolved against the live data home."""
     return _KIRO_SESSIONS_DIR if _KIRO_SESSIONS_DIR is not None else kiro_sessions_dir()
+
+
+def configured_provider_label() -> str:
+    """Provider label for the backend actually driving this turn.
+
+    ``agent.provider`` is pinned to the enum value ``"acp"`` on this fork (see
+    ``docs/system-specs/modules/providers.md``); only ``agent.acp_backend``
+    says whether codex is really serving the turn. A caller that labels a
+    session from ``cfg.agent.provider`` therefore never sees "codex", which
+    breaks every consumer keyed on the distinct label: context.py's
+    spec-adapter gates (``_SPEC_ADAPTER_PROVIDER_TYPES``, this module's
+    ``_SDK_MANAGED_PROVIDERS``), session_map provider tagging
+    (``detect_provider_switch`` / ``seed_conversation``), and the per-turn
+    usage/telemetry provider dimension. This is the one shared place that
+    derives the correct label instead of each call site re-deriving it (and
+    getting it wrong) from the pinned enum.
+
+    Not for callers that specifically mean the dormant claude_code seam —
+    those keep comparing ``== "claude_code"`` directly, since that backend is
+    orthogonal to the acp-vs-codex distinction this helper answers.
+
+    ``configured_acp_backend`` is imported lazily so importing this (small,
+    widely-imported) module never pulls in ``acp.client`` at import time.
+    """
+    from kiro_crew.acp.client import configured_acp_backend
+
+    return "codex" if configured_acp_backend() == "codex" else "acp"
 
 
 class ConversationOwnershipConflict(RuntimeError):
@@ -248,7 +282,7 @@ class SessionMap:
         if not entry:
             return None
         sid = entry["sid"]
-        if entry.get("provider") == "claude_code":
+        if entry.get("provider") in _SDK_MANAGED_PROVIDERS:
             return sid
         sessions_dir = _kiro_sessions_dir()
         if sid and (sessions_dir / f"{sid}.json").exists():
@@ -353,7 +387,7 @@ class SessionMap:
         stale = [
             k
             for k, entry in self._data.items()
-            if entry.get("provider") != "claude_code"
+            if entry.get("provider") not in _SDK_MANAGED_PROVIDERS
             and (
                 (entry.get("sid") and not (sessions_dir / f"{entry['sid']}.json").exists())
                 or (

@@ -18,6 +18,7 @@ from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.session_map import configured_provider_label
 from kiro_crew.validation import sanitize_string
 
 logger = logging.getLogger(__name__)
@@ -864,7 +865,7 @@ async def _run_hook_inner(
         full_message, _ = await run_in_embed_pool(
             state.context_builder.build_message,
             message, is_new, session_key, agent=agent, resumed=resumed,
-            provider_type=KiroCrewConfig.load().agent.provider,
+            provider_type=configured_provider_label(),
         )
     result_text = ""
     _complete_event: object | None = None
@@ -897,7 +898,7 @@ async def _run_hook_inner(
             session_key,
             "",
             _complete_event,
-            provider=KiroCrewConfig.load().agent.provider,
+            provider=configured_provider_label(),
             surface="webhook",
             agent=read_effective_agent(client) or agent or "",
             context_used=_used,

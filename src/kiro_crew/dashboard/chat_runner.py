@@ -191,6 +191,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
+from kiro_crew.session_map import _SDK_MANAGED_PROVIDERS, configured_provider_label
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.validation import ValidationError, infer_use_case, validate_ask_user_question
@@ -4017,7 +4018,7 @@ async def _run_chat(
                 compressed_history=compressed,
                 mode=slot.mode,
                 blocks_reads=slot.blocks_reads,
-                provider_type=cfg.agent.provider,
+                provider_type=configured_provider_label(),
                 runtime_source="dashboard",
                 exclude_last_n=1,
                 folder_path=folder_path,
@@ -5612,7 +5613,30 @@ async def _run_chat(
                     _turn_cost_usd = float(_u.cost_usd or 0.0)
                 except (TypeError, ValueError):
                     _turn_elapsed_ms = int((time.monotonic() - _turn_t0) * 1000)
-                if _u.input_tokens or _u.output_tokens or _u.credits:
+                # Backend-aware label for the usage row below ONLY —
+                # _provider_name (inside the gate) stays the pinned "acp" enum
+                # value because _backfill_canonical_model special-cases just
+                # "claude_code" and codex must keep taking that same
+                # non-claude_code (bare wire id) branch, not be swapped
+                # onto the canonical-key path. persist_token_record_async's
+                # provider dimension wants the distinct "codex" label so
+                # codex spend is not misattributed to kiro in the usage
+                # dashboard.
+                _usage_provider_label = configured_provider_label()
+                # kiro reports credits on every billable turn, so a row with
+                # no tokens AND no credits is noise there — but a spec-adapter
+                # backend can complete a real turn with all three empty
+                # (codex-acp forwards no per-turn token counts or credits;
+                # ChatGPT rate-limit forwarding is an open upstream issue), and
+                # this row is what the Usage tab's own-records fallback counts
+                # sessions/messages from on such a host. Persist the completed
+                # turn there even when the usage fields are all zero.
+                if (
+                    _u.input_tokens
+                    or _u.output_tokens
+                    or _u.credits
+                    or _usage_provider_label in _SDK_MANAGED_PROVIDERS
+                ):
                     try:
                         _provider_name = cfg.agent.provider  # type: ignore[possibly-undefined]
                     except (NameError, AttributeError):
@@ -5637,7 +5661,7 @@ async def _run_chat(
                         slot.key,
                         _record_model,
                         event,
-                        provider=_provider_name,
+                        provider=_usage_provider_label,
                         # The row stays keyed by its dashboard slot for title and
                         # navigation joins; source follows the session the turn
                         # actually ran on, including linked channel sessions.
