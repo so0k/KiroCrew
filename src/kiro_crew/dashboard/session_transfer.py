@@ -485,6 +485,12 @@ def _join_layer_b(sessions: Any, sm_key: str, sid: str) -> bool:
         )
         return False
     try:
+        # "acp" is fixed, NOT the configured backend's label: *sid* names a
+        # kiro-cli session pair this module just wrote into
+        # ``kiro_sessions_dir()``, so the row must stay kiro-managed — a label in
+        # ``session_map._SDK_MANAGED_PROVIDERS`` (e.g. "codex") would exempt it
+        # from the kiro-directory validation ``get``/``prune`` do, and point a
+        # backend that cannot read that format at the sid.
         sessions.seed_conversation(sm_key, sid, provider="acp")
         return True
     except Exception:

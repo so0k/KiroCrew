@@ -18,7 +18,8 @@ from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.acp.client import configured_acp_backend
-from kiro_crew.acp.types import TurnUsage
+from kiro_crew.acp.types import ACP_BACKEND_CODEX, TurnUsage
+from kiro_crew.codex_usage import CodexRateLimitWindow, latest_rate_limits
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.context_blocks import USER_LABEL
 from kiro_crew.hooks import validate_file_path
@@ -1824,6 +1825,62 @@ def get_usage_cache() -> dict:
         return {}
 
 
+def _codex_window_block(window: CodexRateLimitWindow | None) -> dict[str, Any] | None:
+    """Wire form of one codex rate-limit window, ``null`` when codex has none.
+
+    ``secondary`` is routinely null in codex's own payload (the shorter 5h
+    window is not always reported), so the frontend must handle a null window
+    rather than an all-zero one — a fabricated 0% window would render as an
+    empty quota the account does not actually have.
+    """
+    if window is None:
+        return None
+    return {
+        "used_percent": window.used_percent,
+        "window_minutes": window.window_minutes,
+        "resets_at": window.resets_at,
+    }
+
+
+def _codex_billing_block() -> dict[str, Any]:
+    """``billing`` for GET /api/usage/kiro on a codex host, ``{}`` when unknown.
+
+    Blocking filesystem work (it reads codex's own rollout logs) — call it off
+    the event loop, like :func:`_parse_sessions`.
+
+    This is a side channel: codex-acp forwards none of the
+    ChatGPT-subscription rate-limit data over ACP (upstream codex-acp issue
+    #334), so the numbers are lifted from the ``token_count`` event codex
+    appends to its own per-session rollout log. When that lands over the wire,
+    this helper and :mod:`kiro_crew.codex_usage` are deleted together and the
+    handler reads the live value instead.
+
+    ``{}`` keeps its existing meaning of "no billing to show" — the same
+    answer a kiro-cli host with no parsed credit plan gives — so a host with no
+    codex rollout store yet renders exactly as before rather than showing zeros.
+    """
+    limits = latest_rate_limits()
+    if limits is None:
+        return {}
+    credits = limits.credits
+    return {
+        "provider": ACP_BACKEND_CODEX,
+        "plan_type": limits.plan_type,
+        "primary": _codex_window_block(limits.primary),
+        "secondary": _codex_window_block(limits.secondary),
+        "credits": (
+            None
+            if credits is None
+            else {
+                "has_credits": credits.has_credits,
+                "unlimited": credits.unlimited,
+                "balance": credits.balance,
+            }
+        ),
+        "captured_at": limits.captured_at,
+    }
+
+
 async def api_kiro_usage(request: web.Request) -> web.Response:
     """GET /api/usage/kiro — local session analytics + cached billing."""
     global _CACHE, _CACHE_TS
@@ -1846,30 +1903,36 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
         loop = asyncio.get_running_loop()
         sessions = await loop.run_in_executor(None, _parse_sessions)
 
-        # Get billing from existing usage cache. get_usage_cache() is populated
-        # only by the kiro-cli credit-plan scrape/RTS lookup (sessions.py), so
-        # this stays {} on a codex host through the same "no credits_plan
-        # parsed" branch below — codex-acp does not yet forward the
-        # ChatGPT-subscription rate-limit/usage data upstream, so there is no
-        # billing source to surface there. {} is the correct answer, not a
-        # gap: it matches how any kiro-cli host with no parsed credit plan
-        # already renders, while sessions above still carries real activity.
+        # Billing comes from whichever backend actually served the turns, and
+        # the two backends bill in different units — kiro-cli in credits
+        # against a plan, codex in percent-of-window against a ChatGPT
+        # subscription — so the block is one shape OR the other, never merged.
+        # A codex host is read from codex's own rollout logs (see
+        # _codex_billing_block); every other host keeps the kiro-cli path
+        # below byte for byte. Both yield {} when there is nothing to show,
+        # which is what the frontend already treats as "no billing".
         billing: dict = {}
-        usage = get_usage_cache()
-        # Only surface billing when a real credit plan parsed. The cache can hold
-        # an {"available": False} sentinel (kiro-cli absent / unparseable output)
-        # which is truthy but carries no billing fields — treat it as no billing.
-        if usage.get("credits_plan") is not None:
-            billing = {
-                "credits_used": usage.get("credits_used"),
-                "credits_plan": usage.get("credits_plan"),
-                "credits_overage": usage.get("credits_overage"),
-                "percentage": usage.get("percentage"),
-                "cost_usd": usage.get("cost_usd"),
-                "resets": usage.get("resets"),
-                "plan": usage.get("plan"),
-                "overage_rate": usage.get("overage_rate"),
-            }
+        if configured_acp_backend() == ACP_BACKEND_CODEX:
+            billing = await loop.run_in_executor(None, _codex_billing_block)
+        else:
+            # get_usage_cache() is populated only by the kiro-cli credit-plan
+            # scrape/RTS lookup (sessions.py).
+            usage = get_usage_cache()
+            # Only surface billing when a real credit plan parsed. The cache can
+            # hold an {"available": False} sentinel (kiro-cli absent /
+            # unparseable output) which is truthy but carries no billing
+            # fields — treat it as no billing.
+            if usage.get("credits_plan") is not None:
+                billing = {
+                    "credits_used": usage.get("credits_used"),
+                    "credits_plan": usage.get("credits_plan"),
+                    "credits_overage": usage.get("credits_overage"),
+                    "percentage": usage.get("percentage"),
+                    "cost_usd": usage.get("cost_usd"),
+                    "resets": usage.get("resets"),
+                    "plan": usage.get("plan"),
+                    "overage_rate": usage.get("overage_rate"),
+                }
 
         response: dict[str, Any] = {
             "username": username,
