@@ -31,7 +31,7 @@ import kiro_crew.cli_doctor as cli_doctor
 import kiro_crew.session as session_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpAuthRequired, AcpClient, AcpError, AcpModelUnavailable
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, JsonRpcMessage
 from kiro_crew.config import schema as config_schema
 from kiro_crew.config import validation
 from kiro_crew.config.loader import AgentConfig, KiroCrewConfig, _acp_backend_value
@@ -1291,6 +1291,434 @@ class TestMergedSessionMcpServers:
         servers = seen[0]["mcpServers"]
         assert len(servers) == 1
         assert set(servers[0]) == {"name", "command", "args", "env"}
+
+
+class TestCodexMcpNameSanitizer:
+    """``_codex_safe_mcp_name`` maps a declared name onto codex's legal charset.
+
+    codex accepts ``[A-Za-z0-9_-]+`` only and DROPS an entry whose name fails it
+    with no error and no log line: the server simply never appears in the tool
+    registry. Verified live in one session, where ``aws-docs`` was listed and
+    searchable while ``awslabs.aws-documentation-mcp-server`` — declared in the
+    same ``session/new``, dots being the disqualifier — was absent.
+    """
+
+    def test_legal_name_is_returned_unchanged(self) -> None:
+        for name in ("aws-docs", "kirocrew_core", "Server9"):
+            assert client_mod._codex_safe_mcp_name(name, set()) == name
+
+    def test_legal_name_still_honours_taken(self) -> None:
+        """A legal name that is already claimed must move too. Handing codex two
+        entries with one name drops a whole declared toolset — the failure this
+        guard exists to prevent — so "already legal" is no reason to skip the
+        collision check."""
+        out = client_mod._codex_safe_mcp_name("aws-docs", {"aws-docs"})
+        assert out.startswith("aws-docs-") and out != "aws-docs"
+
+    def test_trailing_newline_is_not_treated_as_legal(self) -> None:
+        """``$``-anchored ``match`` also accepts a final newline; codex's own
+        end-of-text ``$`` does not, so such a name would still be dropped."""
+        assert client_mod._codex_safe_mcp_name("aws-docs\n", set()) == "aws-docs"
+
+    def test_dotted_vendor_name_is_sanitized(self) -> None:
+        assert (
+            client_mod._codex_safe_mcp_name("awslabs.aws-documentation-mcp-server", set())
+            == "awslabs-aws-documentation-mcp-server"
+        )
+
+    def test_invalid_runs_collapse_and_edges_are_stripped(self) -> None:
+        assert client_mod._codex_safe_mcp_name(".a b/@c.", set()) == "a-b-c"
+
+    def test_collision_gets_a_stable_digest_suffix(self) -> None:
+        first = client_mod._codex_safe_mcp_name("a.b", set())
+        second = client_mod._codex_safe_mcp_name("a/b", {first})
+        assert first == "a-b"
+        assert second.startswith("a-b-") and second != first
+        # Derived from the ORIGINAL name, so it does not depend on which of the
+        # two colliding servers happened to be declared first.
+        assert client_mod._codex_safe_mcp_name("a/b", {"a-b", "other"}) == second
+
+    def test_all_invalid_name_falls_back_to_the_digest(self) -> None:
+        out = client_mod._codex_safe_mcp_name("...", set())
+        assert out and client_mod._CODEX_MCP_NAME_RE.fullmatch(out)
+        assert "-" not in out
+
+
+class TestCodexWireMcpNames:
+    """``_codex_wire_mcp_names`` assigns the whole session's names at once.
+
+    Assigning one name at a time makes the outcome depend on declaration order,
+    and lets a sanitized name land on a server that was declared legally.
+    """
+
+    def test_a_legal_name_is_never_displaced_by_a_sanitized_one(self) -> None:
+        both_orders = [
+            client_mod._codex_wire_mcp_names(["a.b", "a-b"]),
+            client_mod._codex_wire_mcp_names(["a-b", "a.b"]),
+        ]
+        for wire in both_orders:
+            # The legally-declared name keeps its spelling; the dotted one moves.
+            assert wire["a-b"] == "a-b"
+            assert wire["a.b"].startswith("a-b-")
+        assert both_orders[0] == both_orders[1]
+
+    def test_two_colliding_illegal_names_are_order_independent(self) -> None:
+        """Both take the suffix, so which one would have kept the plain base is
+        not decided by iteration order."""
+        first = client_mod._codex_wire_mcp_names(["foo.bar", "foo bar"])
+        second = client_mod._codex_wire_mcp_names(["foo bar", "foo.bar"])
+        assert first == second
+        assert set(first.values()) == {first["foo.bar"], first["foo bar"]}
+        assert all(v.startswith("foo-bar-") for v in first.values())
+
+    def test_reserved_names_cannot_be_taken_by_an_outside_server(self) -> None:
+        """``kirocrew-core`` is trusted by literal spelling (the session-directive
+        server), so a configured ``kirocrew core`` must not speak under it."""
+        wire = client_mod._codex_wire_mcp_names(
+            ["kirocrew core"], reserved={"kirocrew-core", "kirocrew-computer"}
+        )
+        assert wire["kirocrew core"].startswith("kirocrew-core-")
+
+    def test_managed_servers_are_the_reserved_set(self) -> None:
+        from kiro_crew.agent import _MANAGED_MCP_SERVERS
+
+        reserved = client_mod._reserved_codex_mcp_names()
+        assert reserved == frozenset(_MANAGED_MCP_SERVERS)
+        # The two names trusted by literal spelling downstream are in it.
+        assert {"kirocrew-core", "kirocrew-computer"} <= reserved
+
+    def test_repeated_declaration_maps_to_one_wire_name(self) -> None:
+        # The same server declared by both sources is one rename, not two.
+        wire = client_mod._codex_wire_mcp_names(["a.b", "a.b"])
+        assert wire == {"a.b": "a-b"}
+
+    def test_a_legal_name_matching_the_suffixed_form_displaces_nobody(self) -> None:
+        """The suffixed spelling is re-checked against ``taken`` too.
+
+        A server legally named exactly ``<base>-<6hex of the dotted name>``
+        would otherwise absorb the sanitized entry — one wire name shipping one
+        of two declared servers, with every per-server decision for the
+        survivor taken under the OTHER server's declared identity. The
+        sanitized name must widen its digest instead, in every declaration
+        order.
+        """
+        import hashlib
+
+        digest = hashlib.sha256(b"a.b").hexdigest()
+        legal_twin = f"a-b-{digest[:6]}"
+        for order in (["a-b", "a.b", legal_twin], [legal_twin, "a.b", "a-b"]):
+            wire = client_mod._codex_wire_mcp_names(order)
+            assert wire["a-b"] == "a-b"
+            assert wire[legal_twin] == legal_twin
+            assert wire["a.b"] == f"a-b-{digest[:7]}"
+            assert len(set(wire.values())) == 3
+
+
+class TestSpecIdentityOnToolCallEvent:
+    """The tool_call EVENT carries the spec-adapter MCP identity, declared name.
+
+    chat_runner's session-directive gate keys on ``event.mcp_server_name``
+    (never the per-``toolCallId`` caches), so an identity that reaches only the
+    caches means session directives can never register on codex. The identity
+    must also be the DECLARED name: codex reports ``rawInput.server`` as the
+    wire name it was handed, which may be a sanitized spelling.
+    """
+
+    def test_tool_call_event_carries_declared_spec_identity(self, tmp_path: Path) -> None:
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+        client._mcp_wire_to_declared["aws-docs-2e7336"] = "aws.docs"
+        msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "exec-1",
+                    "kind": "execute",
+                    "title": "mcp.aws-docs-2e7336.search_documentation",
+                    "status": "in_progress",
+                    "rawInput": {
+                        "server": "aws-docs-2e7336",
+                        "tool": "search_documentation",
+                        "arguments": {},
+                    },
+                    "_meta": {"is_mcp_tool_call": True},
+                }
+            },
+        )
+        event = client._extract_tool_event(msg)
+        assert event is not None
+        assert event.mcp_server_name == "aws.docs"
+        assert event.tool_name == "search_documentation"
+        assert event.is_shell is False
+
+    def test_unrenamed_server_passes_through_verbatim(self, tmp_path: Path) -> None:
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+        msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "exec-2",
+                    "kind": "execute",
+                    "title": "mcp.kirocrew-core.ask_question",
+                    "status": "in_progress",
+                    "rawInput": {
+                        "server": "kirocrew-core",
+                        "tool": "ask_question",
+                        "arguments": {},
+                    },
+                    "_meta": {"is_mcp_tool_call": True},
+                }
+            },
+        )
+        event = client._extract_tool_event(msg)
+        assert event is not None
+        assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_name == "ask_question"
+
+
+class TestSpecAdapterMcpNameGuard:
+    """The sanitizer is applied on the spec-adapter path of the wire array only."""
+
+    @staticmethod
+    def _codex(tmp_path: Path) -> AcpClient:
+        return AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+
+    @pytest.mark.asyncio
+    async def test_dotted_name_reaches_codex_sanitized(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._codex(tmp_path)
+        monkeypatch.setattr(client, "_codex_session_mcp_servers", lambda: [])
+        monkeypatch.setattr(
+            client,
+            "_pooled_mcp_servers",
+            lambda: [
+                {
+                    "name": "awslabs.aws-documentation-mcp-server",
+                    "command": sys.executable,
+                    "args": [
+                        "-m",
+                        "kiro_crew.mcp_gateway.stub",
+                        "--server",
+                        "awslabs.aws-documentation-mcp-server",
+                    ],
+                    "env": [],
+                }
+            ],
+        )
+        merged = await client._session_mcp_servers()
+        assert [s["name"] for s in merged] == ["awslabs-aws-documentation-mcp-server"]
+        # Routing is unaffected: the stub keeps its own --server <original> argv,
+        # so only the label codex knows changes.
+        assert "awslabs.aws-documentation-mcp-server" in merged[0]["args"]
+
+    @pytest.mark.asyncio
+    async def test_rename_is_warned_naming_both_spellings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A silent rewrite would leave an operator's per-server governance rule
+        # or trust pattern pointing at a name codex never reports.
+        client = self._codex(tmp_path)
+        monkeypatch.setattr(
+            client, "_codex_session_mcp_servers", lambda: [{"name": "a.b", "command": "x"}]
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+            await client._session_mcp_servers()
+        msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("'a.b'" in m and "'a-b'" in m for m in msgs), msgs
+
+    @pytest.mark.asyncio
+    async def test_legal_names_are_untouched_and_unwarned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = self._codex(tmp_path)
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [{"name": "kirocrew-core", "command": "x", "args": [], "env": []}],
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+            merged = await client._session_mcp_servers()
+        assert [s["name"] for s in merged] == ["kirocrew-core"]
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    @pytest.mark.asyncio
+    async def test_same_dotted_name_from_both_sources_still_dedupes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The dedupe is the whole point of the merge: one server declared by both
+        # sources must not become two elements just because it was renamed, and
+        # the broker stub must still win.
+        client = self._codex(tmp_path)
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [{"name": "a.b", "command": "direct", "args": [], "env": []}],
+        )
+        monkeypatch.setattr(
+            client,
+            "_pooled_mcp_servers",
+            lambda: [{"name": "a.b", "command": sys.executable, "args": [], "env": []}],
+        )
+        merged = await client._session_mcp_servers()
+        assert [s["name"] for s in merged] == ["a-b"]
+        assert merged[0]["command"] == sys.executable
+
+    @pytest.mark.asyncio
+    async def test_two_different_names_colliding_stay_two_servers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Collapsing them would silently drop one server's whole toolset.
+        client = self._codex(tmp_path)
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [
+                {"name": "a.b", "command": "one", "args": [], "env": []},
+                {"name": "a/b", "command": "two", "args": [], "env": []},
+            ],
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+        merged = await client._session_mcp_servers()
+        names = [s["name"] for s in merged]
+        assert len(names) == 2 and len(set(names)) == 2
+        assert all(client_mod._CODEX_MCP_NAME_RE.fullmatch(n) for n in names)
+        assert {s["command"] for s in merged} == {"one", "two"}
+
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            [("a.b", "dotted"), ("a-b", "legal")],
+            [("a-b", "legal"), ("a.b", "dotted")],
+        ],
+        ids=["dotted-first", "legal-first"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_legally_declared_name_is_never_overwritten(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        declared: list[tuple[str, str]],
+    ) -> None:
+        # Sanitizing 'a.b' onto a name another server declared legally would drop
+        # one of the two and its whole toolset — the exact failure the sanitizer
+        # exists to prevent — and which one survived would depend on order.
+        client = self._codex(tmp_path)
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [
+                {"name": name, "command": cmd, "args": [], "env": []} for name, cmd in declared
+            ],
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+        merged = await client._session_mcp_servers()
+        assert {s["command"] for s in merged} == {"dotted", "legal"}
+        by_command = {s["command"]: s["name"] for s in merged}
+        assert by_command["legal"] == "a-b"
+        assert by_command["dotted"].startswith("a-b-")
+        assert all(client_mod._CODEX_MCP_NAME_RE.fullmatch(s["name"]) for s in merged)
+
+    @pytest.mark.asyncio
+    async def test_claude_seam_does_not_rename(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The charset rule is codex's own. Renaming on a backend that accepts the
+        # name would break its per-server rules for nothing.
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        monkeypatch.setattr(
+            client,
+            "_pooled_mcp_servers",
+            lambda: [{"name": "a.b", "command": "x", "args": [], "env": []}],
+        )
+        merged = await client._session_mcp_servers()
+        assert [s["name"] for s in merged] == ["a.b"]
+        assert client._mcp_wire_to_declared == {}
+
+
+class TestSanitizedNameKeepsItsDeclaredIdentity:
+    """A rename is a codex-side label, not a new identity.
+
+    Per-server matching downstream — a governance rule, the app-own-server
+    auto-approve (which partitions an ``<app>:<server>`` name on ``:``, a
+    character no legal codex name can hold), a trust pattern, the
+    session-directive server check — is written against the DECLARED name, so the
+    wire name is translated back where the identity is captured.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raw_input_server_is_reported_as_declared(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [{"name": "artifacts:core", "command": "x", "args": [], "env": []}],
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+        merged = await client._session_mcp_servers()
+        wire_name = merged[0]["name"]
+        assert wire_name == "artifacts-core"
+        assert client._declared_mcp_server(wire_name) == "artifacts:core"
+        # codex answers with the wire name; the cached identity the permission
+        # event inherits must be the declared one.
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "exec-1",
+                        "kind": "execute",
+                        "title": f"mcp.{wire_name}.artifact_save",
+                        "rawInput": {"server": wire_name, "tool": "artifact_save"},
+                        "_meta": {"is_mcp_tool_call": True},
+                    }
+                },
+            )
+        )
+        assert client._tool_call_mcp_server["exec-1"] == "artifacts:core"
+        event = client._build_permission_event(
+            JsonRpcMessage(
+                id="req-1",
+                method="session/request_permission",
+                params={"toolCall": {"toolCallId": "exec-1", "kind": "execute"}},
+            )
+        )
+        assert event.mcp_server_name == "artifacts:core"
+        assert event.title == "mcp__artifacts:core__artifact_save"
+
+    @pytest.mark.asyncio
+    async def test_an_unrenamed_name_passes_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+        monkeypatch.setattr(
+            client,
+            "_codex_session_mcp_servers",
+            lambda: [{"name": "aws-docs", "command": "x", "args": [], "env": []}],
+        )
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
+        await client._session_mcp_servers()
+        assert client._mcp_wire_to_declared == {}
+        assert client._declared_mcp_server("aws-docs") == "aws-docs"
+
+    @pytest.mark.asyncio
+    async def test_kiro_path_keeps_the_dotted_name_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # kiro-cli accepts a dotted server name, and renaming it there would
+        # break every existing per-server rule for no benefit.
+        client = AcpClient(work_dir=tmp_path)
+        pooled = [{"name": "awslabs.aws-documentation-mcp-server", "command": "x", "args": []}]
+        monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [dict(e) for e in pooled])
+        assert await client._session_mcp_servers() == pooled
 
 
 class TestAuthRequiredBypassesTheRetryLadder:

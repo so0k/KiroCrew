@@ -1323,6 +1323,7 @@ class TestPermissionEventCarriesRawParams:
         client._tool_call_is_shell = {}
         client._tool_call_mcp_server = {}
         client._tool_call_tool_name = {}
+        client._tool_call_titles = {}
         client._permission_options = {}
         # Simulate the ToolCall notification caching structured params...
         client._tool_call_params["tc-1"] = {"path": "/etc/passwd", "command": None}

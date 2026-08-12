@@ -20,6 +20,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
+from kiro_crew.acp._dispatch import UNRESOLVED_TOOL_TITLE
 from kiro_crew.acp.client import (
     AcpModelUnavailable,
     codex_base_model_id,
@@ -3772,6 +3773,22 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "mode": mode})
 
 
+def _record_trusted_pattern(slot: _ChatSlot, pattern: str) -> None:
+    """Add *pattern* to the slot's session-scoped trust set, refusing a placeholder.
+
+    A tool whose name could not be resolved reaches the dialog as
+    ``UNRESOLVED_TOOL_TITLE``; recording that as a trust key would auto-approve
+    EVERY later request whose name is equally unresolvable, which is a
+    session-wide grant from a single per-tool click. The base-command variant
+    (``unknown *``, and the bare form derived from it) is refused for the same
+    reason. Refusing is fail-closed: the request still goes to the human.
+    """
+    pattern = pattern.strip()
+    if not pattern or pattern.split(" ", 1)[0] == UNRESOLVED_TOOL_TITLE:
+        return
+    slot._trusted_patterns.add(pattern)
+
+
 def _get_pattern_from_pending(slot: _ChatSlot, request_id: str, field: str) -> str:
     """Extract a pattern field from the permission message matching request_id."""
     if not request_id:
@@ -3859,7 +3876,7 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
         if not pattern:
             pattern = _get_pattern_from_pending(owner, request_id, "full_command")
         if pattern:
-            owner._trusted_patterns.add(pattern)
+            _record_trusted_pattern(owner, pattern)
         action = "approved"
     # Trust-base: trust the base command glob e.g. "ls *" (session-scoped)
     # For multi-command titles ("cat,wc"), adds patterns for each binary.
@@ -3871,12 +3888,12 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
         for p in pattern.split(","):
             p = p.strip()
             if p:
-                owner._trusted_patterns.add(p)
+                _record_trusted_pattern(owner, p)
                 # Also trust the bare command (no args) since "ls *" doesn't match "ls"
                 if p.endswith(" *"):
                     bare = p[:-2]
                     if bare:
-                        owner._trusted_patterns.add(bare)
+                        _record_trusted_pattern(owner, bare)
         action = "approved"
     # YOLO: auto-approve all tools globally (all slots)
     elif action == "yolo":

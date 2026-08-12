@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ import time
 from collections import deque
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Sequence
+from typing import Any, AsyncGenerator, AsyncIterator, Collection, Container, Sequence
 
 from kiro_crew import agent_discovery, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
@@ -40,6 +41,7 @@ from kiro_crew.acp._dispatch import (
     extract_tool_purpose,
     parse_session_modes,
     parse_usage_update,
+    resolve_permission_title,
     spec_adapter_mcp_identity,
 )
 from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOracle
@@ -173,6 +175,128 @@ CODEX_PERMISSION_BYPASS_POLICIES = frozenset({"never", "on-failure"})
 # vendor keys) on the same element, which is why entries reaching a spec adapter
 # are reduced to this set rather than forwarded verbatim.
 _ACP_STDIO_SERVER_KEYS = frozenset({"name", "command", "args", "env"})
+
+# codex accepts an MCP server name of `[A-Za-z0-9_-]+` ONLY and DROPS every entry
+# that fails it — silently: no error on the wire, no log line, the server simply
+# never appears in the tool registry. Verified live in one session, where
+# "aws-docs" was listed and searchable while
+# "awslabs.aws-documentation-mcp-server" (declared in the same session/new, dots
+# being the disqualifier) was absent. Matched with `fullmatch`, never `match`: a
+# `$`-anchored `match` also accepts a trailing newline, and codex (Rust regex,
+# end-of-text `$`) would still drop such a name.
+_CODEX_MCP_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+_CODEX_MCP_NAME_INVALID_RE = re.compile(r"[^A-Za-z0-9_-]+")
+# Length of the sha256-derived suffix used to break a sanitization collision.
+# Six hex chars keep the wire name readable; the input space is the small set of
+# server names in one session, so a wider digest buys nothing.
+_CODEX_MCP_NAME_HASH_LEN = 6
+
+
+def _codex_safe_mcp_name(name: str, taken: Container[str]) -> str:
+    """*name* rewritten to satisfy codex's MCP-name rule, avoiding *taken*.
+
+    Every run of invalid characters collapses to a single ``-`` and
+    leading/trailing ``-`` are stripped; a name that sanitizes to nothing
+    (all-invalid characters) falls back to the digest alone. An already-legal
+    name keeps its spelling. Either way, a result that is already ``taken``
+    gets a sha256 prefix of the ORIGINAL name appended, so two declared
+    servers can never land on one wire name — the ``taken`` check applies to a
+    legal name too, because "a declared server silently disappears" is the exact
+    failure this guard exists to prevent and it happens just as readily when the
+    survivor is the legal one. The suffixed candidate is re-checked against
+    ``taken`` as well (a declared server could legally spell the suffixed form),
+    widening the digest deterministically until the name is free — the digest is
+    64 hex chars against a handful of servers per session, so this always
+    terminates with a distinct name and never drops an entry.
+    """
+    full_digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()
+    if _CODEX_MCP_NAME_RE.fullmatch(name):
+        sanitized = name
+    else:
+        sanitized = (
+            _CODEX_MCP_NAME_INVALID_RE.sub("-", name).strip("-")
+            or full_digest[:_CODEX_MCP_NAME_HASH_LEN]
+        )
+    if sanitized not in taken:
+        return sanitized
+    for end in range(_CODEX_MCP_NAME_HASH_LEN, len(full_digest) + 1):
+        candidate = f"{sanitized}-{full_digest[:end]}"
+        if candidate not in taken:
+            return candidate
+    # Unreachable with a session-sized taken set (59 widening steps, all
+    # distinct); the full-digest spelling is still deterministic per original.
+    return f"{sanitized}-{full_digest}"
+
+
+def _codex_wire_mcp_names(
+    names: Sequence[str], reserved: Collection[str] = frozenset()
+) -> dict[str, str]:
+    """Declared MCP server name -> the name codex is told, for one session.
+
+    Resolved in two passes so the outcome never depends on declaration order:
+
+    1. Every already-legal name claims its own spelling. A legal name is never
+       rewritten, so a per-server rule written against it keeps matching, and it
+       cannot be displaced by a sanitized name that lands on it.
+    2. Each remaining name is sanitized. When several distinct declared names
+       reduce to one base — or when that base was claimed in pass 1, or is
+       *reserved* — EVERY name in the group takes the digest suffix, so which one
+       would have kept the plain spelling is not decided by iteration order
+       either.
+
+    *reserved* holds wire names an outside server must not be able to occupy;
+    see :func:`_reserved_codex_mcp_names`.
+    """
+    wire: dict[str, str] = {}
+    illegal: list[str] = []
+    for name in names:
+        if name in wire or name in illegal:
+            continue
+        if _CODEX_MCP_NAME_RE.fullmatch(name):
+            wire[name] = name
+        else:
+            illegal.append(name)
+    # Reserved names count as taken from the start, so neither a base nor a
+    # suffixed spelling can occupy one.
+    taken: set[str] = set(wire.values()) | set(reserved)
+    # Group by the base each name sanitizes to (the same helper with nothing
+    # taken yields that base) so a contested base is visible before any name is
+    # assigned.
+    bases: dict[str, list[str]] = {}
+    for name in illegal:
+        bases.setdefault(_codex_safe_mcp_name(name, ()), []).append(name)
+    for base, originals in bases.items():
+        contested = len(originals) > 1 or base in taken
+        for name in originals:
+            # The full live ``taken`` set backs every assignment, so a suffixed
+            # spelling can never silently displace an earlier one either.
+            wire[name] = _codex_safe_mcp_name(name, taken | {base} if contested else taken)
+            taken.add(wire[name])
+    return wire
+
+
+def _reserved_codex_mcp_names() -> frozenset[str]:
+    """Wire names no outside MCP server may occupy on a codex session.
+
+    Kiro Crew trusts a couple of MCP server names by literal spelling — the
+    session-directive core server and the computer-use server, both managed
+    ``kirocrew-*`` entries — so a configured server named ``kirocrew core``
+    sanitizing onto ``kirocrew-core`` would speak under a trusted identity.
+    Reserving the managed names makes the impostor take the digest suffix even
+    when the managed server it shadows is absent from this session (a managed
+    entry whose invocation cannot be resolved is skipped).
+
+    Best-effort: the names only harden a collision that ordering already makes
+    unlikely, so a lookup failure must not cost the session its servers.
+    """
+    try:
+        from kiro_crew.agent import _MANAGED_MCP_SERVERS
+
+        return frozenset(_MANAGED_MCP_SERVERS)
+    except Exception:
+        logger.debug("managed MCP server names unavailable to reserve", exc_info=True)
+        return frozenset()
+
 
 KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
@@ -2471,6 +2595,22 @@ class AcpClient:
         # canonical mcp__<server>__<tool> for per-tool governance in the
         # app-own-server auto-approve.
         self._tool_call_tool_name: dict[str, str] = {}
+        # Map toolCallId → the ADAPTER-authored tool title, cached from the
+        # tool_call notification so a later permission_request that carries no
+        # title of its own can still name the tool. codex-acp's
+        # request_permission toolCall holds only {toolCallId, kind, status}, so
+        # without this every codex approval renders as "unknown" — and the
+        # dashboard's trust dropdown records that as the trust PATTERN,
+        # blanket-approving every later request in the session. NOT the pill's
+        # display title: that one prefers the model's rawInput.description, which
+        # the approval gate must never match on. Mirrors _tool_call_is_shell's
+        # lifecycle.
+        self._tool_call_titles: dict[str, str] = {}
+        # Wire MCP server name → the name it was declared under, for the names
+        # _session_mcp_servers had to rewrite for codex. Empty on every other
+        # backend and whenever no name needed rewriting. See
+        # _declared_mcp_server for why the translation exists.
+        self._mcp_wire_to_declared: dict[str, str] = {}
         # Structured raw tool params (rawInput dict) keyed by toolCallId, cached
         # from the ToolCall notification so the later request_permission event —
         # which carries only a truncated title — can recover the real path/url
@@ -2677,24 +2817,79 @@ class AcpClient:
 
         On a spec adapter each surviving element is also reduced to
         :data:`_ACP_STDIO_SERVER_KEYS`; see that constant for why an extra key is
-        fatal rather than ignored. The kiro path is untouched: its alt list is
-        empty and the pooled names are already unique, so the merge is identity.
+        fatal rather than ignored. On codex the names additionally go through
+        :func:`_codex_wire_mcp_names`, because codex drops a server whose name
+        holds a character outside ``[A-Za-z0-9_-]`` (a dotted vendor name such as
+        ``awslabs.aws-documentation-mcp-server``) without reporting anything.
+        Only codex, not every spec adapter: the rule is codex's own, and renaming
+        a server on a backend that accepts the name would break its per-server
+        rules for nothing.
+
+        A rewritten name is recorded in ``_mcp_wire_to_declared``, because codex
+        reports the WIRE name back as ``rawInput.server`` while every per-server
+        decision downstream — a governance rule, the app-own-server auto-approve,
+        a trust pattern, the session-directive server check — is written against
+        the DECLARED name. :meth:`_declared_mcp_server` translates the identity
+        back at the tool_call site, so the rename is confined to the label codex
+        sees. Routing is likewise unaffected: the broker stub keeps its own
+        ``--server <original>`` argv and a managed entry keeps its command.
+
+        The kiro path is untouched: its alt list is empty, the pooled names are
+        already unique, and no name is rewritten, so the merge is identity.
 
         Both sources touch the filesystem (binary resolution / overlay reads), so
         each runs in a worker rather than on the session-creation loop.
         """
         alt = await asyncio.to_thread(self._alt_session_mcp_servers)
         pooled = await asyncio.to_thread(self._pooled_mcp_servers)
-        merged: dict[str, dict[str, Any]] = {}
         # Pooled last so a broker stub OVERWRITES the direct entry of the same name.
-        for entry in [*alt, *pooled]:
-            name = entry.get("name")
-            if not isinstance(name, str) or not name:
-                continue
+        entries = [
+            entry
+            for entry in [*alt, *pooled]
+            if isinstance(entry.get("name"), str) and entry.get("name")
+        ]
+        # Resolved for the whole session before any entry is emitted: a name may
+        # only be rewritten with every other declared name in view, or the
+        # rewrite can land on a server that was declared legally and silently
+        # replace it.
+        wire_names: dict[str, str] = {}
+        if self._is_codex:
+            wire_names = _codex_wire_mcp_names(
+                [str(entry["name"]) for entry in entries],
+                reserved=_reserved_codex_mcp_names(),
+            )
+        self._mcp_wire_to_declared.clear()
+        merged: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            name = str(entry["name"])
             if self._is_spec_adapter:
                 entry = {k: v for k, v in entry.items() if k in _ACP_STDIO_SERVER_KEYS}
-            merged[name] = entry
+            wire_name = wire_names.get(name, name)
+            if wire_name != name:
+                # One warning per rewritten name: the same server declared by both
+                # sources is one rename, not two.
+                if wire_name not in self._mcp_wire_to_declared:
+                    logger.warning(
+                        "MCP server name %r is not codex-legal; declaring it as %r "
+                        "(codex drops an illegal name silently). The declared name "
+                        "stays the one governance and trust patterns match.",
+                        name,
+                        wire_name,
+                    )
+                self._mcp_wire_to_declared[wire_name] = name
+                entry["name"] = wire_name
+            merged[wire_name] = entry
         return list(merged.values())
+
+    def _declared_mcp_server(self, wire_name: str) -> str:
+        """The name *wire_name* was declared under (identity if not rewritten).
+
+        codex names a dispatch by the sanitized wire name; downstream matching is
+        written against the operator's declared name. Translating here keeps the
+        rename a codex-side label rather than a new identity every per-server
+        rule would have to be rewritten for.
+        """
+        return self._mcp_wire_to_declared.get(wire_name, wire_name)
 
     @property
     def is_ready(self) -> bool:
@@ -4805,6 +5000,7 @@ class AcpClient:
         self._pending_skill_reads.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
+        self._tool_call_titles.clear()
         self._tool_call_params.clear()
         # Reset the per-turn observed-tool-call bookkeeping (see __init__).
         self._observed_tool_calls.clear()
@@ -5852,6 +6048,11 @@ class AcpClient:
             # mcp__<server>__<tool> instead of denying an unverifiable shell
             # command (rawInput carries the MCP triple, never a command line).
             _spec_server, _spec_tool = spec_adapter_mcp_identity(update)
+            # codex names the dispatch by the wire name it was handed, which may
+            # be a sanitized spelling; every per-server decision downstream is
+            # written against the declared name.
+            if _spec_server:
+                _spec_server = self._declared_mcp_server(_spec_server)
             is_shell = False if _spec_server else _is_shell_kind(kind)
             if tool_call_id:
                 self._tool_call_is_shell[tool_call_id] = is_shell
@@ -5865,6 +6066,19 @@ class AcpClient:
                 # Cache the trusted tool name too, so the permission event can
                 # rebuild mcp__<server>__<tool> for per-tool governance.
                 self._tool_call_tool_name[tool_call_id] = _kiro_tool_name(update) or _spec_tool
+            # Cache the ADAPTER-authored title (the literal invocation) so a later
+            # permission_request that carries none can name the tool — see
+            # resolve_permission_title. Deliberately NOT the display title
+            # selected below: that one prefers the model's own
+            # rawInput.description, and hooks.on_tool_call matches the permission
+            # title against auto_approve_tools, so a description feeding it would
+            # let the model name its own call whatever the user has trusted.
+            # Redacted, because the same value reaches the dashboard dialog. Same
+            # lifecycle as the is_shell cache above.
+            if tool_call_id and isinstance(title, str) and title:
+                adapter_title, _ = redact_exfiltration_urls(title)
+                adapter_title, _ = redact_credentials(adapter_title)
+                self._tool_call_titles[tool_call_id] = adapter_title
             title = _select_tool_title(title, raw_input) or ""
             if title:
                 title, _ = redact_exfiltration_urls(title)
@@ -5875,6 +6089,12 @@ class AcpClient:
             self.last_prompt_stats.tool_calls.append((kind, title))
             # Trusted identity from _meta.kiro (NOT the LLM-authored title) —
             # shared with the _dispatch builder so both event paths carry it.
+            # The spec-adapter identity (declared-name-translated above) rides
+            # the SAME fields, exactly as it already does in the per-toolCallId
+            # caches and in the _dispatch builder: without it the tool_call
+            # EVENT has an empty mcp_server_name on codex, so chat_runner's
+            # session-directive gate (which keys on the event, not the caches)
+            # can never register a directive tool there.
             return AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 title=title,
@@ -5884,8 +6104,8 @@ class AcpClient:
                 tool_call_id=tool_call_id,
                 raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
                 is_shell=is_shell,
-                tool_name=_kiro_tool_name(update),
-                mcp_server_name=_kiro_mcp_server_name(update),
+                tool_name=_kiro_tool_name(update) or _spec_tool,
+                mcp_server_name=_kiro_mcp_server_name(update) or _spec_server,
             )
         return None
 
@@ -6027,6 +6247,15 @@ class AcpClient:
         if title_source:
             title_str, _ = redact_exfiltration_urls(title_source)
             title_str, _ = redact_credentials(title_str)
+        # Refresh the permission-fallback title only when this refinement carries
+        # an ADAPTER-authored title of its own (same rule as the shell signal
+        # below): a refinement holding only a rawInput.description must neither
+        # erase the real invocation the initial tool_call cached nor put
+        # model-authored prose in front of the approval gate.
+        if isinstance(title, str) and title:
+            adapter_title, _ = redact_exfiltration_urls(title)
+            adapter_title, _ = redact_credentials(adapter_title)
+            self._tool_call_titles[tool_use_id] = adapter_title
         kind_str = ""
         if isinstance(kind, str) and kind:
             kind_str, _ = redact_exfiltration_urls(kind)
@@ -6123,7 +6352,6 @@ class AcpClient:
         tool_call = params.get("toolCall", {})
         if not isinstance(tool_call, dict):
             tool_call = {}
-        title = tool_call.get("title", "unknown")
         # The ACP toolCall carries a `kind` ("execute" for Bash, "read"/"edit"/
         # …). Carry it onto the event as display/telemetry metadata. NOTE: the
         # tool-name length-cap exemption does NOT key off this value — it uses
@@ -6249,6 +6477,22 @@ class AcpClient:
                 tool_call_id,
             )
 
+        # Trusted identity recovered from the preceding tool_call (the permission
+        # payload has no _meta). .get() mirrors the is_shell cache-read; empty on
+        # a miss (fail-closed for the app-own-server auto-approve).
+        mcp_server_name = self._tool_call_mcp_server.get(tool_call_id, "") if tool_call_id else ""
+        tool_name = self._tool_call_tool_name.get(tool_call_id, "") if tool_call_id else ""
+        # Name the request. A titleless payload (codex-acp sends only
+        # {toolCallId, kind, status}) resolves to the canonical identity or the
+        # cached display title rather than to "unknown", which the dashboard would
+        # otherwise record as a session-wide trust pattern.
+        title = resolve_permission_title(
+            tool_call.get("title"),
+            mcp_server_name=mcp_server_name,
+            tool_name=tool_name,
+            cached_title=self._tool_call_titles.get(tool_call_id, "") if tool_call_id else "",
+        )
+
         logger.info("Permission requested for tool: %s (req=%s)", title, request_id)
         if logger.isEnabledFor(logging.DEBUG):
             _tc_redacted = repr(tool_call)
@@ -6265,18 +6509,8 @@ class AcpClient:
             tool_call_id=tool_call_id,
             raw_tool_params=raw_params,
             is_shell=is_shell,
-            # Trusted MCP server identity recovered from the preceding tool_call
-            # (the permission payload has no _meta). .get() mirrors the is_shell
-            # cache-read; empty on a miss (fail-closed for app-own auto-approve).
-            mcp_server_name=(
-                self._tool_call_mcp_server.get(tool_call_id, "") if tool_call_id else ""
-            ),
-            # Trusted tool name recovered from the preceding tool_call, mirroring
-            # mcp_server_name — lets the app-own-server auto-approve govern the
-            # canonical mcp__<server>__<tool> on this permission path.
-            tool_name=(
-                self._tool_call_tool_name.get(tool_call_id, "") if tool_call_id else ""
-            ),
+            mcp_server_name=mcp_server_name,
+            tool_name=tool_name,
         )
 
     def _backfill_context_window(self, pct: float) -> None:

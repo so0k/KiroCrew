@@ -408,6 +408,14 @@ class AcpSessionHandle:
         # so the permission event can rebuild mcp__<server>__<tool> for per-tool
         # governance in the app-own-server auto-approve.
         self._tool_call_tool_name: dict[str, str] = {}
+        # toolCallId -> the ADAPTER-authored tool title, cached from the tool_call
+        # notification so a permission_request carrying no title of its own
+        # (codex-acp sends only {toolCallId, kind, status}) can still name the
+        # tool instead of reaching the dashboard as "unknown" — which the trust
+        # dropdown would record as a session-wide pattern. Not the pill's display
+        # title: that one prefers the model's rawInput.description, which the
+        # approval gate must never match on. Mirrors _tool_call_is_shell.
+        self._tool_call_titles: dict[str, str] = {}
         # Server names for which a mid-session MCP OAuth banner was already
         # emitted, so we don't spam duplicates. Discarded on the matching
         # server_initialized / server_init_failure so a later token-expiry
@@ -523,6 +531,7 @@ class AcpSessionHandle:
         self._tool_call_raw_params.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
+        self._tool_call_titles.clear()
         self._permission_options.clear()
 
         # Drain frames left over from a prior abandoned turn. The cancel-unacked
@@ -2089,6 +2098,7 @@ class AcpSessionHandle:
             raw_params_cache=self._tool_call_raw_params,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            title_cache=self._tool_call_titles,
         )
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
@@ -2142,6 +2152,7 @@ class AcpSessionHandle:
             raw_params_cache=self._tool_call_raw_params,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            title_cache=self._tool_call_titles,
         )
         for ev in events:
             if ev.kind == EVENT_TEXT_CHUNK:

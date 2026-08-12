@@ -441,6 +441,39 @@ class TestSecurityRedaction:
         assert slot._trust is True
 
 
+class TestUnresolvedTitleIsNeverATrustPattern:
+    """The placeholder a nameless permission request carries must not become a key.
+
+    A permission request whose tool could not be named reaches the dialog as
+    ``UNRESOLVED_TOOL_TITLE``; recording that as a trusted pattern would match
+    every later request that is equally unnameable, turning one per-tool click
+    into a session-wide auto-approve. Refusing it is fail-closed — the request
+    still goes to the human.
+    """
+
+    def test_placeholder_forms_are_refused(self):
+        from kiro_crew.acp._dispatch import UNRESOLVED_TOOL_TITLE
+        from kiro_crew.dashboard.chat_handlers import _record_trusted_pattern
+
+        slot = _ChatSlot(key="test-slot")
+        for pattern in (
+            UNRESOLVED_TOOL_TITLE,
+            f"{UNRESOLVED_TOOL_TITLE} *",
+            f"  {UNRESOLVED_TOOL_TITLE}  ",
+            "",
+        ):
+            _record_trusted_pattern(slot, pattern)
+        assert slot._trusted_patterns == set()
+        assert _matches_trusted_pattern(UNRESOLVED_TOOL_TITLE, slot._trusted_patterns) is None
+
+    def test_a_resolved_name_is_still_recorded(self):
+        from kiro_crew.dashboard.chat_handlers import _record_trusted_pattern
+
+        slot = _ChatSlot(key="test-slot")
+        _record_trusted_pattern(slot, " mcp__kirocrew-core__artifact_save ")
+        assert slot._trusted_patterns == {"mcp__kirocrew-core__artifact_save"}
+
+
 # ── Edge cases and boundary conditions ──
 
 

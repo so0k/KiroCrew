@@ -17,6 +17,11 @@ Three landed fixes are pinned here:
    (``id in _native_tc_card``). A forged shell result (no ``mcp_server_name``,
    an LLM-authored title, and a marker in stdout) is therefore never honoured.
 
+Also pinned here, because it decides which name a trust pattern is recorded
+against: the permission-title fallback (``_dispatch.resolve_permission_title``),
+which keeps a titleless codex permission payload from being displayed — and
+trusted — as ``unknown``.
+
 The ``_meta.kiro`` fixture shape mirrors ``test_todo_list_surface.py``.
 """
 
@@ -29,7 +34,13 @@ import pytest
 from chat_test_helpers import _make_state
 
 from kiro_crew import session_directive
-from kiro_crew.acp._dispatch import _build_tool_call_event, _kiro_mcp_server_name
+from kiro_crew.acp._dispatch import (
+    _build_tool_call_event,
+    _kiro_mcp_server_name,
+    build_permission_event,
+    parse_session_update,
+    resolve_permission_title,
+)
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
@@ -38,6 +49,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     AcpEvent,
+    JsonRpcMessage,
 )
 
 # ── Part 1: ACP identity plumbing ─────────────────────────────────────────────
@@ -194,6 +206,390 @@ class TestSpecAdapterMcpIdentity:
         event = _build_tool_call_event(upd, None)
         assert event.is_shell is True
         assert event.mcp_server_name == ""
+
+
+class TestPermissionTitleFallback:
+    """A permission request that carries no title must not be named "unknown".
+
+    codex-acp's ``session/request_permission`` payload holds only
+    ``{toolCallId, kind, status}`` under ``toolCall``. "unknown" is not merely a
+    cosmetic dialog label: the dashboard records ``event.title`` as the trust
+    PATTERN, so one "always allow" on an ``unknown`` dialog auto-approves EVERY
+    later permission request in the session (observed live). The fallback
+    prefers the adapter-authored ``mcp__<server>__<tool>`` identity, then the
+    display title the preceding ``tool_call`` cached.
+    """
+
+    def test_canonical_identity_wins_over_the_cached_title(self) -> None:
+        assert (
+            resolve_permission_title(
+                None,
+                mcp_server_name="kirocrew-core",
+                tool_name="artifact_save",
+                cached_title="mcp.kirocrew-core.artifact_save",
+            )
+            == "mcp__kirocrew-core__artifact_save"
+        )
+
+    def test_recovered_title_is_capped_under_the_tool_name_limit(self) -> None:
+        """A long recovered title must not become a rejected permission.
+
+        A non-shell permission title is length-validated downstream
+        (``_validate_tool_name`` raises past ``MAX_TOOL_NAME_LEN``), and the old
+        ``unknown`` placeholder always passed — so an uncapped recovered title
+        would be a new denial path for long non-exec adapter titles.
+        """
+        from kiro_crew.validation import MAX_TOOL_NAME_LEN
+
+        long_title = "Read " + "x" * 400
+        out = resolve_permission_title("", cached_title=long_title)
+        assert out == long_title[: MAX_TOOL_NAME_LEN - 1]
+        canonical = resolve_permission_title("", mcp_server_name="s" * 300, tool_name="t")
+        assert len(canonical) < MAX_TOOL_NAME_LEN
+
+    def test_display_title_is_used_when_identity_is_incomplete(self) -> None:
+        """Half an identity is not an identity — a wrong canonical name would be
+        governed and trusted as a tool that does not exist."""
+        assert (
+            resolve_permission_title(
+                "", mcp_server_name="kirocrew-core", cached_title="Running: ls -la"
+            )
+            == "Running: ls -la"
+        )
+
+    def test_payload_title_still_wins(self) -> None:
+        """The kiro dialect always sends a title; that path must not change."""
+        assert (
+            resolve_permission_title(
+                "Running: rm -rf /tmp/x",
+                mcp_server_name="kirocrew-core",
+                tool_name="artifact_save",
+                cached_title="cached",
+            )
+            == "Running: rm -rf /tmp/x"
+        )
+
+    def test_literal_unknown_payload_is_treated_as_absent(self) -> None:
+        """A payload naming the tool "unknown" carries no more information than
+        an omitted field, and it is the exact value that poisons the pattern."""
+        assert (
+            resolve_permission_title("unknown", mcp_server_name="srv", tool_name="tool")
+            == "mcp__srv__tool"
+        )
+
+    def test_nothing_resolvable_stays_unknown(self) -> None:
+        assert resolve_permission_title(None) == "unknown"
+
+    def test_non_string_payload_title_does_not_crash(self) -> None:
+        assert resolve_permission_title({"nested": "dict"}, cached_title="Reading a file") == (
+            "Reading a file"
+        )
+
+
+class TestAcpClientPermissionTitle:
+    """End-to-end over ``AcpClient``: the codex tool_call → permission sequence."""
+
+    @staticmethod
+    def _client(tmp_path) -> Any:
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+        return AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+
+    @staticmethod
+    def _tool_call(update: dict[str, Any]) -> JsonRpcMessage:
+        return JsonRpcMessage(method="session/update", params={"update": update})
+
+    @staticmethod
+    def _permission(tool_call: dict[str, Any]) -> JsonRpcMessage:
+        """A codex permission frame: no title, no _meta, no rawInput."""
+        return JsonRpcMessage(
+            id="req-1",
+            method="session/request_permission",
+            params={
+                "toolCall": tool_call,
+                "options": [{"optionId": "allow_once", "name": "Allow once"}],
+            },
+        )
+
+    def test_codex_mcp_permission_resolves_the_canonical_name(self, tmp_path) -> None:
+        client = self._client(tmp_path)
+        client._extract_tool_event(
+            self._tool_call(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "exec-41ccd89a",
+                    "kind": "execute",
+                    "title": "mcp.kirocrew-core.artifact_save",
+                    "rawInput": {
+                        "server": "kirocrew-core",
+                        "tool": "artifact_save",
+                        "arguments": {"name": "x"},
+                    },
+                    "_meta": {"is_mcp_tool_call": True},
+                }
+            )
+        )
+        event = client._build_permission_event(
+            self._permission(
+                {"toolCallId": "exec-41ccd89a", "kind": "execute", "status": "pending"}
+            )
+        )
+        assert event.title == "mcp__kirocrew-core__artifact_save"
+        # The identity fields the governance gate reads are unchanged.
+        assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_name == "artifact_save"
+
+    def test_shell_permission_falls_back_to_the_cached_title(self, tmp_path) -> None:
+        """A codex shell call has no MCP identity, so the cached display title is
+        the only specific name available."""
+        client = self._client(tmp_path)
+        client._extract_tool_event(
+            self._tool_call(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "exec-shell",
+                    "kind": "execute",
+                    "title": "Running: ls -la",
+                    "rawInput": {"command": "ls -la"},
+                }
+            )
+        )
+        event = client._build_permission_event(
+            self._permission({"toolCallId": "exec-shell", "kind": "execute"})
+        )
+        assert event.title == "Running: ls -la"
+        assert event.is_shell is True
+
+    def test_description_never_names_the_permission_request(self, tmp_path) -> None:
+        """The pill may show the model's ``rawInput.description``; the approval
+        gate must not. ``hooks.on_tool_call`` matches the permission title
+        against ``auto_approve_tools``, so a description feeding that name would
+        let the model label ``chmod -R 777`` as something the user has trusted."""
+        client = self._client(tmp_path)
+        forged = {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "exec-forge",
+            "kind": "execute",
+            "title": "bash -lc 'chmod -R 777 /Users/x'",
+            "rawInput": {
+                "command": "chmod -R 777 /Users/x",
+                "description": "ls -la /tmp",
+            },
+        }
+        pill = client._extract_tool_event(self._tool_call(forged))
+        assert pill is not None and pill.title == "ls -la /tmp"
+        event = client._build_permission_event(
+            self._permission({"toolCallId": "exec-forge", "kind": "execute"})
+        )
+        assert event.title == "bash -lc 'chmod -R 777 /Users/x'"
+
+    def test_a_description_only_refinement_keeps_the_real_invocation(self, tmp_path) -> None:
+        """A refinement carrying no title of its own must not overwrite the
+        adapter's invocation with model prose (same rule as the shell signal)."""
+        client = self._client(tmp_path)
+        client._extract_tool_event(
+            self._tool_call(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "exec-refine",
+                    "kind": "execute",
+                    "title": "bash -lc 'chmod -R 777 /Users/x'",
+                    "rawInput": {"command": "chmod -R 777 /Users/x"},
+                }
+            )
+        )
+        client._extract_tool_call_refinement(
+            self._tool_call(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "exec-refine",
+                    "rawInput": {
+                        "command": "chmod -R 777 /Users/x",
+                        "description": "ls -la /tmp",
+                    },
+                }
+            )
+        )
+        event = client._build_permission_event(
+            self._permission({"toolCallId": "exec-refine", "kind": "execute"})
+        )
+        assert event.title == "bash -lc 'chmod -R 777 /Users/x'"
+
+    def test_uncached_tool_call_id_stays_unknown(self, tmp_path) -> None:
+        """Fail-closed on a cache miss: nothing is invented for an id no
+        tool_call was ever seen for."""
+        client = self._client(tmp_path)
+        event = client._build_permission_event(self._permission({"toolCallId": "never-seen"}))
+        assert event.title == "unknown"
+
+    def test_kiro_payload_with_a_title_is_unchanged(self, tmp_path) -> None:
+        from kiro_crew.acp.client import AcpClient
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            self._tool_call(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-kiro",
+                    "kind": "other",
+                    "title": "Arming a monitor loop",
+                    "rawInput": {"message": "check PR"},
+                    "_meta": {
+                        "kiro": {
+                            "toolName": "monitor_start",
+                            "mcpServerName": "kirocrew-core",
+                        }
+                    },
+                }
+            )
+        )
+        event = client._build_permission_event(
+            self._permission({"toolCallId": "tc-kiro", "title": "Arming a monitor loop"})
+        )
+        assert event.title == "Arming a monitor loop"
+
+    def test_title_cache_is_reset_per_turn_on_both_transports(self) -> None:
+        """A title left by a previous turn must not name a permission request in
+        the next one, so the cache shares the per-turn lifecycle of its sibling
+        caches. Asserted on source: both reset sites run inside a live prompt
+        turn (an agent subprocess and a real queue), which no unit test drives."""
+        import inspect
+
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.session_handle import AcpSessionHandle
+
+        assert "self._tool_call_titles.clear()" in inspect.getsource(AcpClient._dispatch_events)
+        assert "self._tool_call_titles.clear()" in inspect.getsource(AcpSessionHandle)
+
+
+class TestSharedBuilderPermissionTitle:
+    """``_dispatch.build_permission_event`` must apply the identical fallback so
+    the two transports cannot drift on the name that becomes a trust pattern."""
+
+    @staticmethod
+    def _frame(tool_call: dict[str, Any]) -> JsonRpcMessage:
+        return JsonRpcMessage(
+            id="req-9",
+            method="session/request_permission",
+            params={"toolCall": tool_call},
+        )
+
+    def test_canonical_identity_from_the_caller_caches(self) -> None:
+        event, _ = build_permission_event(
+            self._frame({"toolCallId": "exec-1", "kind": "execute"}),
+            mcp_server_name_cache={"exec-1": "kirocrew-core"},
+            tool_name_cache={"exec-1": "artifact_save"},
+            title_cache={"exec-1": "mcp.kirocrew-core.artifact_save"},
+        )
+        assert event.title == "mcp__kirocrew-core__artifact_save"
+
+    def test_cached_display_title_without_identity(self) -> None:
+        event, _ = build_permission_event(
+            self._frame({"toolCallId": "exec-1", "kind": "execute"}),
+            title_cache={"exec-1": "Running: ls -la"},
+        )
+        assert event.title == "Running: ls -la"
+
+    def test_tool_call_update_writes_the_title_cache(self) -> None:
+        """The builders own the write side: a refinement carrying a better title
+        must refresh it, and a title-less refinement must not erase it."""
+        title_cache: dict[str, str] = {}
+        parse_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "kind": "execute",
+                "title": "Running: ls",
+                "rawInput": {"command": "ls"},
+            },
+            title_cache=title_cache,
+        )
+        assert title_cache == {"tc-1": "Running: ls"}
+        parse_session_update(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "title": "Running: ls -la /tmp",
+            },
+            title_cache=title_cache,
+        )
+        assert title_cache == {"tc-1": "Running: ls -la /tmp"}
+        parse_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "kind": "execute"},
+            title_cache=title_cache,
+        )
+        assert title_cache == {"tc-1": "Running: ls -la /tmp"}
+
+    def test_the_cache_holds_the_adapter_title_not_the_description(self) -> None:
+        """Both transports cache the same value, so neither can offer the model's
+        prose to the approval gate."""
+        title_cache: dict[str, str] = {}
+        events = parse_session_update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-2",
+                "kind": "execute",
+                "title": "bash -lc 'chmod -R 777 /Users/x'",
+                "rawInput": {
+                    "command": "chmod -R 777 /Users/x",
+                    "description": "ls -la /tmp",
+                },
+            },
+            title_cache=title_cache,
+        )
+        # The pill keeps the friendly description; the cache does not.
+        assert events[0].title == "ls -la /tmp"
+        assert title_cache == {"tc-2": "bash -lc 'chmod -R 777 /Users/x'"}
+        parse_session_update(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-2",
+                "rawInput": {"description": "ls -la /tmp"},
+            },
+            title_cache=title_cache,
+        )
+        assert title_cache == {"tc-2": "bash -lc 'chmod -R 777 /Users/x'"}
+        event, _ = build_permission_event(
+            self._frame({"toolCallId": "tc-2", "kind": "execute"}), title_cache=title_cache
+        )
+        assert event.title == "bash -lc 'chmod -R 777 /Users/x'"
+
+    def test_no_cache_supplied_keeps_the_payload_title(self) -> None:
+        event, _ = build_permission_event(self._frame({"toolCallId": "x", "title": "Reading"}))
+        assert event.title == "Reading"
+
+
+class TestResolvedTitleBecomesTheTrustPattern:
+    """The dashboard derives the trust pattern from ``event.title``, so the
+    resolved name is what a "trust this tool" click persists. No frontend change
+    is involved — this pins the consumer side of the fallback."""
+
+    def test_canonical_name_yields_a_tool_scoped_pattern(self) -> None:
+        from kiro_crew.dashboard.chat_runner import (
+            _extract_base_command,
+            _extract_full_command,
+            _matches_trusted_pattern,
+        )
+
+        title = resolve_permission_title(
+            None, mcp_server_name="kirocrew-core", tool_name="artifact_save"
+        )
+        assert _extract_full_command(title) == "mcp__kirocrew-core__artifact_save"
+        assert _extract_base_command(title) == "mcp__kirocrew-core__artifact_save"
+        # The persisted pattern trusts THAT tool and nothing else.
+        patterns = {_extract_base_command(title)}
+        assert _matches_trusted_pattern(title, patterns) == title
+        assert _matches_trusted_pattern("mcp__kirocrew-core__memory_write", patterns) is None
+
+    def test_unknown_pattern_would_have_matched_every_titleless_request(self) -> None:
+        """Why the fallback exists: trusting an ``unknown`` dialog recorded
+        ``unknown`` as the pattern, which then matched every later titleless
+        codex permission request in the session."""
+        from kiro_crew.dashboard.chat_runner import _extract_base_command, _matches_trusted_pattern
+
+        patterns = {_extract_base_command("unknown")}
+        assert _matches_trusted_pattern("unknown", patterns) == "unknown"
 
 
 # ── Part 3: chat_runner directive gate (security regression, integration) ─────

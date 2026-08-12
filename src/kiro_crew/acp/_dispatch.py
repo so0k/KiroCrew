@@ -56,6 +56,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.validation import MAX_TOOL_NAME_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -436,6 +437,63 @@ _LEGACY_OPTION_KIND: dict[str, str] = {
     "reject_always": "reject_always",
 }
 
+# Placeholder used when no name can be resolved for a tool. It is also the value
+# a permission payload effectively carries when it omits `title`, so
+# resolve_permission_title treats an incoming "unknown" as "no name given".
+UNRESOLVED_TOOL_TITLE = "unknown"
+
+
+def resolve_permission_title(
+    payload_title: Any,
+    *,
+    mcp_server_name: str = "",
+    tool_name: str = "",
+    cached_title: str = "",
+) -> str:
+    """Display/trust name for a ``session/request_permission``.
+
+    codex-acp's permission payload carries only ``{toolCallId, kind, status}``
+    under ``toolCall`` — no ``title`` — so every codex approval would otherwise
+    be named ``"unknown"``. That name is not merely cosmetic: the dashboard's
+    trust dropdown records ``event.title`` as the trust PATTERN, so one "always
+    allow" on an ``unknown`` dialog auto-approves EVERY later permission request
+    in the session. Recover a name from what the preceding ``tool_call``
+    notification cached for the same ``toolCallId``:
+
+    1. The canonical ``mcp__<server>__<tool>`` when both identity halves are
+       known. That identity is adapter-authored (``_meta.kiro`` on kiro-cli, the
+       ``_meta.is_mcp_tool_call``-guarded rawInput triple on a spec adapter),
+       never LLM prose, which makes it the safest value to persist as a trust
+       pattern and the same key ``hooks.on_tool_call`` governs.
+    2. Otherwise the ADAPTER-authored title the preceding ``tool_call`` cached —
+       the literal invocation, never the model's ``rawInput.description``: the
+       resolved name is what ``hooks.on_tool_call`` matches against
+       ``auto_approve_tools``, so a model-authored value there would let the
+       model name its own call whatever the user has trusted. See the cache
+       write in :func:`_build_tool_call_event`.
+    3. Otherwise ``UNRESOLVED_TOOL_TITLE``, unchanged.
+
+    A payload-provided title always wins, so the kiro dialect (which always
+    sends one) keeps its own name; the value is normalised — surrounding
+    whitespace stripped, a non-string title treated as absent.
+
+    A RECOVERED name (either fallback branch) is capped under
+    ``validation.MAX_TOOL_NAME_LEN``: a non-shell permission title is length-
+    validated downstream (``_validate_tool_name``), and an over-long recovered
+    title would turn into a rejected request where the old ``"unknown"``
+    placeholder sailed through. The payload path stays uncapped — its length
+    behavior predates this rule and shell titles legitimately exceed the cap.
+    """
+    title = payload_title.strip() if isinstance(payload_title, str) else ""
+    if title and title != UNRESOLVED_TOOL_TITLE:
+        return title
+    if mcp_server_name and tool_name:
+        return f"mcp__{mcp_server_name}__{tool_name}"[: MAX_TOOL_NAME_LEN - 1]
+    cached = cached_title.strip()
+    if cached and cached != UNRESOLVED_TOOL_TITLE:
+        return cached[: MAX_TOOL_NAME_LEN - 1]
+    return UNRESOLVED_TOOL_TITLE
+
 
 def build_permission_event(
     msg: JsonRpcMessage,
@@ -445,6 +503,7 @@ def build_permission_event(
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
+    title_cache: dict[str, str] | None = None,
 ) -> tuple[AcpEvent, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
@@ -464,13 +523,15 @@ def build_permission_event(
     notification carried; ``shell_cache`` (caller-owned ``toolCallId -> is_shell``)
     is the ONLY trusted source for the shell signal (deny-by-default — the
     permission payload's own ``kind`` is agent-influenced and must not waive the
-    tool-name length cap).
+    tool-name length cap). ``title_cache`` (caller-owned ``toolCallId ->
+    adapter-authored title``) is the fallback half of the title rule — see
+    :func:`resolve_permission_title` for why a titleless payload must not reach
+    the dashboard as ``"unknown"``.
     """
     request_id = msg.id if msg.id is not None else ""
     params = msg.params or {}
     tool_call = params.get("toolCall", {})
     tool_call = tool_call if isinstance(tool_call, dict) else {}
-    title = _redact(tool_call.get("title", "unknown"))
     # The ACP toolCall carries a `kind` ("execute" for Bash, "read"/"edit"/…).
     # Carry it onto the event as display/telemetry metadata only — the is_shell
     # length-cap exemption resolves from shell_cache below, never this field.
@@ -584,6 +645,39 @@ def build_permission_event(
         if isinstance(_inline, dict):
             _resolved_raw_params = _inline
 
+    # Trusted identity recovered from the preceding tool_call (the permission
+    # payload carries no _meta). .get() (not .pop()) mirrors the is_shell cache: a
+    # later tool_call_update for the same id re-reads it; the per-turn dispatch
+    # .clear() handles cleanup. Empty on a miss (fail-closed: no trusted identity
+    # → no app-own-server auto-approve).
+    _mcp_server_name = (
+        mcp_server_name_cache.get(tool_call_id, "")
+        if (mcp_server_name_cache is not None and tool_call_id)
+        else ""
+    )
+    _tool_name = (
+        tool_name_cache.get(tool_call_id, "")
+        if (tool_name_cache is not None and tool_call_id)
+        else ""
+    )
+    # Name the request. A titleless payload (codex-acp sends {toolCallId, kind,
+    # status}) resolves to the canonical identity or the cached display title
+    # rather than to "unknown", which the dashboard would otherwise record as a
+    # session-wide trust pattern. Redaction still applies: the cached title is
+    # already scrubbed, but the payload title on this path is not.
+    title = _redact(
+        resolve_permission_title(
+            tool_call.get("title"),
+            mcp_server_name=_mcp_server_name,
+            tool_name=_tool_name,
+            cached_title=(
+                title_cache.get(tool_call_id, "")
+                if (title_cache is not None and tool_call_id)
+                else ""
+            ),
+        )
+    )
+
     event = AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
         request_id=request_id,
@@ -594,25 +688,8 @@ def build_permission_event(
         tool_call_id=tool_call_id,
         raw_tool_params=_resolved_raw_params,
         is_shell=is_shell,
-        # Trusted MCP server identity recovered from the preceding tool_call
-        # (the permission payload carries no _meta). .get() (not .pop()) mirrors
-        # the is_shell cache: a later tool_call_update for the same id re-reads
-        # it; the per-turn dispatch .clear() handles cleanup. Empty on a miss
-        # (fail-closed for the app-own-server auto-approve).
-        mcp_server_name=(
-            mcp_server_name_cache.get(tool_call_id, "")
-            if (mcp_server_name_cache is not None and tool_call_id)
-            else ""
-        ),
-        # Trusted tool identity recovered from the preceding tool_call, mirroring
-        # mcp_server_name above. Lets the app-own-server auto-approve govern the
-        # canonical mcp__<server>__<tool> on the permission path (no _meta here).
-        # Empty on a miss (fail-closed: no trusted tool name → no auto-approve).
-        tool_name=(
-            tool_name_cache.get(tool_call_id, "")
-            if (tool_name_cache is not None and tool_call_id)
-            else ""
-        ),
+        mcp_server_name=_mcp_server_name,
+        tool_name=_tool_name,
     )
     return event, recorded
 
@@ -624,6 +701,7 @@ def _build_tool_call_event(
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
+    title_cache: dict[str, str] | None = None,
 ) -> AcpEvent:
     """Build an ``EVENT_TOOL_CALL`` from a ``tool_call`` update (with redaction)."""
     title = update.get("title", "unknown")
@@ -704,6 +782,16 @@ def _build_tool_call_event(
         tool_input_cache[tool_call_id] = input_str
     if purpose:
         purpose = _redact(purpose)
+    # Cache the ADAPTER-authored title (the literal invocation) so a later
+    # permission_request that carries no title of its own can name the tool — see
+    # resolve_permission_title. Deliberately NOT the display title selected
+    # below: that one prefers the model's own rawInput.description, and
+    # hooks.on_tool_call matches the permission title against auto_approve_tools,
+    # so a description feeding it would let the model name its own call whatever
+    # the user has trusted. Redacted, because the same value reaches the dialog.
+    # Same lifecycle as shell_cache.
+    if tool_call_id and title_cache is not None and isinstance(title, str) and title:
+        title_cache[tool_call_id] = _redact(title)
     title = select_tool_title(title, raw_input) or ""
     if title:
         title = _redact(title)
@@ -964,6 +1052,7 @@ def _build_tool_refinement_event(
     update: dict[str, Any],
     tool_input_cache: dict[str, str] | None,
     shell_cache: dict[str, bool] | None = None,
+    title_cache: dict[str, str] | None = None,
 ) -> AcpEvent | None:
     """Build an ``EVENT_TOOL_CALL_UPDATE`` (refined title/kind/input) for a tool.
 
@@ -1009,6 +1098,13 @@ def _build_tool_refinement_event(
             tool_input_cache[tool_use_id] = input_str
     title_source = select_tool_title(title, raw_input)
     title_str = _redact(title_source) if title_source else ""
+    # Refresh the permission-fallback title only when this refinement carries an
+    # ADAPTER-authored title of its own (mirrors the shell-signal rule below): a
+    # refinement holding only a rawInput.description must neither erase the real
+    # invocation the initial tool_call cached nor put model-authored prose in
+    # front of the approval gate.
+    if title_cache is not None and isinstance(title, str) and title:
+        title_cache[tool_use_id] = _redact(title)
     kind_str = _redact(kind) if isinstance(kind, str) and kind else ""
     # Refresh the cached shell signal only when this refinement carries a kind
     # (kind is optional on updates); a kind-less refinement must not clobber a
@@ -1047,6 +1143,7 @@ def parse_session_update(
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
+    title_cache: dict[str, str] | None = None,
 ) -> list[AcpEvent]:
     """Parse one ``session/update`` inner ``update`` dict into ``AcpEvent``s.
 
@@ -1082,6 +1179,7 @@ def parse_session_update(
                 raw_params_cache,
                 mcp_server_name_cache,
                 tool_name_cache,
+                title_cache,
             )
         )
         return events
@@ -1089,7 +1187,7 @@ def parse_session_update(
         result = _build_tool_result_event(update)
         if result is not None:
             events.append(result)
-        refine = _build_tool_refinement_event(update, tool_input_cache, shell_cache)
+        refine = _build_tool_refinement_event(update, tool_input_cache, shell_cache, title_cache)
         if refine is not None:
             events.append(refine)
         # A todo_list result carries the agent's whole task list. Emit it as an
@@ -1157,6 +1255,8 @@ __all__ = [
     "parse_metadata",
     "classify_notification",
     "build_permission_event",
+    "resolve_permission_title",
+    "UNRESOLVED_TOOL_TITLE",
     "parse_session_update",
     "parse_usage_update",
     "parse_text_chunk",

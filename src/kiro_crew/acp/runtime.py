@@ -1405,6 +1405,12 @@ class AcpRuntime:
             mcp_servers = await asyncio.to_thread(
                 pooled_session_servers, self._mcp_gateway_overlay, agent or self._agent
             )
+        # The array goes out verbatim: this runtime speaks the kiro dialect only,
+        # and kiro-cli accepts any server name. A spec adapter served from here
+        # would need AcpClient._session_mcp_servers' two guards first — the
+        # _ACP_STDIO_SERVER_KEYS reduction (a strict deserializer rejects an extra
+        # key and fails the whole session/new) and the codex name sanitizer
+        # (codex drops a name outside [A-Za-z0-9_-] silently).
         params = build_session_new_params(
             cwd if cwd else self._work_dir,
             mcp_servers=mcp_servers,
