@@ -53,9 +53,9 @@ _CACHE_TS: float = 0.0
 _CACHE_TTL = 120  # 2 min
 _CACHE_LOCK = asyncio.Lock()
 
-# Cache for the raw _parse_sessions() result, used by api_usage's
-# claude_code/bedrock branch (api_kiro_usage has its own _CACHE of the full
-# response). _parse_sessions does a full iterdir + per-file stat + line-by-line
+# Cache for the raw _parse_sessions() result, owned by _cached_parse_sessions
+# (api_kiro_usage does its own executor call behind _CACHE, which holds the
+# whole response). _parse_sessions does a full iterdir + per-file stat + line-by-line
 # json.loads of every in-window shard, so it is both TTL-cached (120s) and run
 # off the event loop. _SESSIONS_CACHE_LOCK collapses concurrent cold-cache
 # requests into a single parse (mirrors api_kiro_usage's _CACHE_LOCK).
@@ -1499,8 +1499,11 @@ def _sessions_from_own_records() -> dict:
     """Build the SAME shape as :func:`_parse_sessions` from Kiro Crew's own
     per-turn token-usage shards, for a host where kiro-cli's transcript
     directory does not exist because a non-kiro ACP backend served every
-    turn (currently ``codex``; codex-acp keeps no session transcripts of its
-    own, so the kiro-path parse never has anything to read there).
+    turn (currently ``codex``). Codex does keep transcripts, in its OWN store
+    under ``$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`` (plus its
+    sqlite state) — that is neither the kiro sessions directory nor a layout
+    this module reads, so the kiro-path parse still has nothing to work with
+    there.
 
     Source: the same ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` shards
     ``persist_token_record``/``persist_token_record_async`` already write on
@@ -1513,7 +1516,10 @@ def _sessions_from_own_records() -> dict:
     kiro-path semantics (which reads kiro-cli's own per-session JSONL
     transcripts):
 
-    - A "session" is a distinct dashboard slot key seen in a shard row.
+    - A "session" is a distinct ``slot`` value seen in a shard row, i.e. the
+      slot/session id the writing surface recorded: a bare dashboard chat slot
+      (``chat-69-1785905004``) for a dashboard turn, or the full session key
+      for any other surface (``slack:…``, ``cron:…``, ``subagent:…``).
       Attributed to the day of its EARLIEST turn in the scanned window, the
       same way the kiro path buckets a whole session file under the day of
       its first message — so one long-lived session is counted once, not
@@ -1631,14 +1637,16 @@ def _parse_sessions() -> dict:
     Falls back to :func:`_sessions_from_own_records` when kiro-cli's own
     transcript directory does not exist AND the configured ACP backend is not
     kiro-cli (``configured_acp_backend()`` non-empty, currently only
-    ``"codex"``) — codex-acp keeps no session transcripts of its own, so
-    returning the kiro-path error here would mean the Usage tab never renders
-    on a codex-only host; the frontend must not special-case this, so the
-    backend serves the same shape from its own records instead. A missing
-    directory while still on the kiro-cli backend keeps the existing error
-    contract unchanged: kiro-cli simply has not written a session yet (or
-    ``KIROCREW_HOME`` points somewhere unexpected), both worth surfacing
-    rather than silently backfilling with a lower-fidelity source.
+    ``"codex"``). Codex records its transcripts in its own store under
+    ``$CODEX_HOME/sessions/``, which this module neither reads nor can map
+    onto the kiro layout, so returning the kiro-path error here would mean the
+    Usage tab never renders on a codex-only host; the frontend must not
+    special-case this, so the backend serves the same shape from Kiro Crew's
+    own per-turn token shards instead. A missing directory while still on the
+    kiro-cli backend keeps the existing error contract unchanged: kiro-cli
+    simply has not written a session yet (or ``KIROCREW_HOME`` points somewhere
+    unexpected), both worth surfacing rather than silently backfilling with a
+    lower-fidelity source.
     """
     sessions_dir = _sessions_dir()
     if not sessions_dir.exists():
@@ -1766,9 +1774,15 @@ def _parse_sessions() -> dict:
 async def _cached_parse_sessions() -> dict:
     """Run _parse_sessions() off the event loop with a 120s TTL cache.
 
-    Both usage endpoints call this so neither blocks the aiohttp loop on the
-    iterdir + per-file stat + json.loads scan, and a burst of polls reuses one
-    parse. Returns {} when there is no sessions directory AND the configured
+    The raw-parse entry point: it keeps the iterdir + per-file stat +
+    json.loads scan off the aiohttp loop and collapses a burst of polls into a
+    single parse. No route reaches it today — ``api_usage`` delegates to
+    ``api_kiro_usage``, which calls ``_parse_sessions`` in an executor behind
+    its own ``_CACHE`` of the full response — so tests are its only callers,
+    and it must keep agreeing with ``_parse_sessions`` on both backend paths
+    for whatever is wired to it.
+
+    Returns {} when there is no sessions directory AND the configured
     ACP backend is kiro-cli (``configured_acp_backend() == ""``) — the common
     case is a kiro-cli host that has not written a session yet, where {} is a
     cheaper equivalent to _parse_sessions()'s error result (both are "no

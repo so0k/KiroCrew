@@ -199,14 +199,21 @@ def _pid_file_lock():  # type: ignore[no-untyped-def]
 #     (process_matches) AND the argv[0]-basename match (_work_orphan_basename)
 #     see "codex(-acp)" directly.
 #   - CODEX_ACP_BIN pointing at a non-executable script: wrapped as
-#     `[node, script_path]`. The script path still contains "codex-acp", so the
-#     full-cmdline match (process_matches) still matches — but argv[0] is
-#     `node`, so the work-sweep's argv[0]-basename check does NOT see "codex"
-#     for this shape. That basename check only gates a narrow, already-guarded
-#     path (a test-runner-shaped cmdline that also carries the KIROCREW_SPAWNED
-#     marker — see _is_sweepable_orphan_work), never the pre-kill re-validation
-#     that protects a live codex-acp process, so this gap does not leave a
-#     node-wrapped codex-acp adapter unprotected.
+#     `[node, script_path]`. Here the marker is only as good as the operator's
+#     path: the full-cmdline match (process_matches on Linux/macOS) sees
+#     "codex" only when the script path itself carries it, and on Windows,
+#     where process_matches reads the exe image name, the image is `node.exe`
+#     and the marker never matches at all. The argv[0]-basename gate cannot
+#     see this shape on any platform — the basename IS `node`/`node.exe` — so
+#     that path is structurally unreachable for a node-wrapped adapter. It
+#     gates only a narrow, already-guarded sweep (a test-runner-shaped cmdline
+#     that also carries the KIROCREW_SPAWNED marker — see
+#     _is_sweepable_orphan_work), so the reachable consequence sits in the
+#     pre-kill re-validation: a node-wrapped adapter whose script path carries
+#     no "codex" reads as unmanaged, so a sweep prunes its tracking entry
+#     instead of reaping it — it leaks, and no unrelated process is killed.
+#     A deployment that wants the sweep to reach it keeps "codex" in the
+#     CODEX_ACP_BIN path.
 _MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude", "codex")
 
 

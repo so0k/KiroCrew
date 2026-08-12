@@ -38,11 +38,14 @@ SESSION_MAP_FILENAME = "session_map.json"
 # issue #874; dashboard/handlers/usage.py is the reference implementation.
 _KIRO_SESSIONS_DIR: Path | None = None
 
-# Provider labels whose transcripts live in the backend adapter's own SDK store,
-# NOT in the kiro-cli sessions directory. A mapping for one of these is validated
-# by the adapter on resume, so it must never be pruned against the kiro dir (the
-# file will never be there). kiro-cli entries are labelled "acp" (or "" for
-# legacy rows); every other backend is SDK-managed.
+# Allowlist of the provider labels whose transcripts live in the backend
+# adapter's own SDK store, NOT in the kiro-cli sessions directory. A mapping
+# carrying one of these labels is validated by the adapter on resume, so `get`
+# and `prune` must never check it against the kiro dir (the file will never be
+# there). Membership is explicit rather than derived: every label outside this
+# set — including "acp" and the "" of legacy rows, both meaning kiro-cli — is
+# treated as kiro-managed and pruned against that directory, so a new
+# SDK-backed backend must be added here or its mappings get swept.
 _SDK_MANAGED_PROVIDERS = frozenset({"claude_code", "codex"})
 
 
