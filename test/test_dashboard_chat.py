@@ -8578,7 +8578,7 @@ class TestGenerateEmojiForName:
 
         mock_event = MagicMock()
         mock_event.kind = "text_chunk"
-        mock_event.text = "\u2764\uFE0F"  # ❤️
+        mock_event.text = "\u2764\ufe0f"  # ❤️
         done_event = MagicMock()
         done_event.kind = "complete"
         monkeypatch.setattr("kiro_crew.providers.base.EVENT_TEXT_CHUNK", "text_chunk")
@@ -8590,7 +8590,7 @@ class TestGenerateEmojiForName:
         state.sessions.get_bg_session = AsyncMock(return_value=mock_client)
 
         icon = await generate_emoji_for_name(state, "Love")
-        assert icon == "\u2764\uFE0F"
+        assert icon == "\u2764\ufe0f"
 
 
 class TestFolderAssignmentPersistence:
@@ -13367,10 +13367,13 @@ class TestSlotModelLiveSwitch:
     def _provider(
         *,
         claude: bool = False,
+        codex: bool = False,
         active_turn: bool = False,
         models=("auto",),
         supports_effort: bool = False,
         change_effort: bool = True,
+        process_alive: bool = True,
+        effort_levels=(),
     ):
         """A live AcpProvider double. ``spec=`` keeps isinstance() working."""
         from kiro_crew.providers.acp import AcpProvider
@@ -13379,12 +13382,18 @@ class TestSlotModelLiveSwitch:
         provider.is_claude_backend = claude
         # Pinned explicitly: a spec MagicMock auto-creates a truthy attribute,
         # which would read as a codex client and change the switch semantics.
-        provider.is_codex_backend = False
+        provider.is_codex_backend = codex
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort
+        # The levels THIS session advertised — what a codex composite pick's
+        # effort suffix is validated against.
+        provider.get_valid_effort_levels.return_value = list(effort_levels)
         provider.change_effort = AsyncMock(return_value=change_effort)
         provider.clear_effort = AsyncMock(return_value=False)
+        # Decides whether a failed push reads as "the value was refused" (alive)
+        # or "the call didn't land" (exited).
+        provider.is_process_alive.return_value = process_alive
         provider.client = MagicMock()
         provider.client.set_model = AsyncMock()
         return provider
@@ -13447,7 +13456,11 @@ class TestSlotModelLiveSwitch:
         state.sessions.reset.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_live_switch_failure_falls_back_to_reset(self, tmp_path):
+    async def test_a_live_session_refusing_the_push_rolls_the_slot_back(self, tmp_path):
+        # The session is alive, so it EVALUATED the value and said no. Persisting
+        # it would re-send it at every later init — on the codex path
+        # `_apply_startup_model` then fails the handshake on every respawn, which
+        # is the poisoned-slot loop this rollback exists to prevent.
         state = _make_state(tmp_path)
         state.sessions.reset = AsyncMock()
         provider = self._provider()
@@ -13458,11 +13471,131 @@ class TestSlotModelLiveSwitch:
 
         async with TestClient(TestServer(self._app(state))) as client:
             resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.6-sol"})
+            body = await resp.json()
 
-        # The slot still lands on the new model, via the reset path.
+        assert resp.status == 400
+        assert body["code"] == "model_switch_failed"
+        # The slot keeps the model the session is actually running.
+        assert state._slots["a"].model == "claude-opus-4.8"
+        # No teardown: the conversation is intact and still on the prior model.
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_switch_on_a_dead_process_falls_back_to_reset(self, tmp_path):
+        # Nothing evaluated the value here — the process is gone. The reset is the
+        # recovery, and the cold start applies the pick.
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(process_alive=False)
+        provider.client.set_model = AsyncMock(side_effect=RuntimeError("boom"))
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        state.get_or_create_slot("a", model="claude-opus-4.8")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.6-sol"})
+
         assert resp.status == 200
         assert state._slots["a"].model == "gpt-5.6-sol"
         state.sessions.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_codex_composite_id_reaches_the_wire_as_the_bare_id(self, tmp_path):
+        # codex-acp advertises one composite entry per effort level but accepts
+        # only the bare id on the `model` push, answering -32602 for the rest.
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(codex=True)
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        state.get_or_create_slot("a", model="gpt-5.6-terra")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/a/model", json={"model": "gpt-5.6-sol[medium]"}
+            )
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.6-sol")
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_pick_routes_its_effort_suffix_to_the_effort_option(self, tmp_path):
+        # The codex picker rows for one model differ ONLY by effort, so the row
+        # the user clicked carries both halves of the choice. Dropping the suffix
+        # would discard the effort pick; it rides its own config option instead.
+        from kiro_crew.dashboard.chat_persistence import update_reasoning_effort_values
+
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(
+            codex=True,
+            supports_effort=True,
+            # `ultra` is codex-only — a clamp to the canonical five would drop it.
+            effort_levels=("low", "medium", "high", "ultra"),
+        )
+        # What a live codex session does at init: `_sync_effort_levels` unions its
+        # advertised levels into the sanitized allowlist that gates persistence.
+        # (conftest restores the process-global set after the test.)
+        update_reasoning_effort_values(["low", "medium", "high", "ultra"])
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        state.get_or_create_slot("a", model="gpt-5.6-sol[low]")
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/a/model", json={"model": "gpt-5.6-sol[ultra]"}
+            )
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.6-sol")
+        provider.change_effort.assert_awaited_once_with("ultra")
+        # Persisted on the slot, so the next cold start re-applies the same level
+        # through the provider factory instead of losing it with the suffix.
+        assert state._slots["a"].reasoning_effort == "ultra"
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_pick_ignores_a_level_the_session_does_not_advertise(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(codex=True, supports_effort=True, effort_levels=("low", "medium"))
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="gpt-5.6-terra")
+        slot.reasoning_effort = "medium"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/a/model", json={"model": "gpt-5.6-sol[bogus]"}
+            )
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.6-sol")
+        # The slot keeps the level it had, and that is what gets re-pushed.
+        assert state._slots["a"].reasoning_effort == "medium"
+        provider.change_effort.assert_awaited_once_with("medium")
+
+    @pytest.mark.asyncio
+    async def test_a_bare_codex_pick_leaves_the_slot_effort_alone(self, tmp_path):
+        # No suffix means no effort claim: the empty-suffix path must behave
+        # exactly as it did before the split existed.
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(
+            codex=True, supports_effort=True, effort_levels=("low", "medium", "ultra")
+        )
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="gpt-5.6-terra")
+        slot.reasoning_effort = "low"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.6-sol"})
+
+        assert resp.status == 200
+        assert state._slots["a"].reasoning_effort == "low"
+        provider.change_effort.assert_awaited_once_with("low")
 
     @pytest.mark.asyncio
     async def test_auto_uses_the_advertised_auto_id(self, tmp_path):

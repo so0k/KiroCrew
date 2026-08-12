@@ -4,11 +4,12 @@ Verifies (see the task-spec investigation) that the canonical-key registry
 (``model_registry.json``) holds only Claude/Fable-shaped keys plus ``auto`` —
 no ``gpt-*``/openai-shaped entry — so ``model_registry.is_canonical_key``
 never fires on a codex-advertised model id such as ``gpt-5.6-sol`` or its
-effort-suffixed siblings. Effort is applied out-of-band via
-``effort.effort_settings_key`` (a separate cli.json sub-key), never appended
-to the model id string, so there is no ``gpt-5.6-sol-high``-shaped id to
-worry about either. Because ``agent.provider`` is pinned to ``"acp"`` on this
-fork regardless of ``agent.acp_backend`` (kiro vs. codex), the guard's
+effort-suffixed siblings. Effort travels on its own channel — the ``effort``
+config option live, ``effort.effort_settings_key`` on disk — so no
+effort-bearing spelling is a registry key either, including codex-acp's
+``<model>[<effort>]`` display form (which ``codex_base_model_id`` splits before
+the wire; see test_acp_backend_codex). Because ``agent.provider`` is pinned to
+``"acp"`` on this fork regardless of ``agent.acp_backend`` (kiro vs. codex), the guard's
 existing ``claude_code`` exemption is dormant for codex and none is needed:
 a real codex model id is never a registry key, so it is never rejected.
 """

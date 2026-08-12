@@ -636,6 +636,56 @@ def codex_approval_policy() -> str:
     return policy.strip() if isinstance(policy, str) else ""
 
 
+# A trailing ``[...]`` group in a codex model name: the adapter's ModelId
+# display form ``<model>[<effort>]`` (e.g. ``gpt-5.6-sol[medium]``).
+_CODEX_MODEL_EFFORT_SUFFIX_RE = re.compile(r"\[([^\[\]]*)\]\s*$")
+
+
+def codex_base_model_id(model_id: str) -> str:
+    """The bare codex model id accepted by a ``configId="model"`` push.
+
+    codex-acp is inconsistent between the two directions: it ADVERTISES one
+    ``availableModels`` entry per effort level (``gpt-5.6-sol[low]`` …
+    ``[ultra]``, the display form of its internal ModelId) yet the model push
+    ACCEPTS only the bare id, answering ``-32602 invalid params`` for the
+    composite — verified live, where ``gpt-5.6-sol`` was acked on the same
+    session that had just rejected ``gpt-5.6-sol[medium]``. Effort
+    rides its own ``effort`` option, so the suffix is routed there (see
+    :func:`codex_model_effort_suffix`) rather than translated into the model
+    value. A composite that reaches the wire is fatal beyond the one call: it is
+    applied again at every session init, so each respawn fails the same way.
+
+    Codex-scoped by design and never applied on the kiro or claude paths, whose
+    ids carry a MEANINGFUL bracket suffix (``...claude-opus-4-8[1m]`` selects the
+    1M-token window) that must reach the wire intact.
+
+    A value that is nothing but a suffix is returned unchanged: there is no bare
+    id to recover, and the backend's own rejection names the real value.
+    """
+    stripped = _CODEX_MODEL_EFFORT_SUFFIX_RE.sub("", model_id).strip()
+    return stripped or model_id
+
+
+def codex_model_effort_suffix(model_id: str) -> str:
+    """The effort level a composite codex model id carries, or ``""``.
+
+    The counterpart of :func:`codex_base_model_id`: because the advertised
+    entries for one model differ ONLY by this suffix, the row a picker sends is
+    both halves of a choice — model and effort — and dropping the suffix would
+    discard the effort the user selected. Callers route the returned level into
+    the effort mechanism (the ``effort`` config option / the slot's persisted
+    level) while the bare id goes onto the model push.
+
+    Returns ``""`` when there is no suffix, when it is empty, or when the value
+    is nothing but a suffix — there is no model to pair the level with, and
+    :func:`codex_base_model_id` keeps that value whole.
+    """
+    match = _CODEX_MODEL_EFFORT_SUFFIX_RE.search(model_id)
+    if not match or not model_id[: match.start()].strip():
+        return ""
+    return match.group(1).strip()
+
+
 # One WARN per process for an unreadable config; see configured_acp_backend.
 _acp_backend_read_warned = False
 
@@ -1176,11 +1226,13 @@ def _model_is_unentitled(data: str, available_models: Sequence[str] | None) -> s
     if not available_models:
         return None
     rejected = match.group(1)
-    # Compare case-insensitively on the bare id: the rejection echoes back the
-    # id that was sent, but casing has no meaning in these ids and an
-    # entitled-but-differently-cased match must not be reported as unentitled.
-    advertised = {m.strip().lower() for m in available_models if m and m.strip()}
-    if rejected.strip().lower() in advertised:
+    # Delegates to the shared predicate rather than re-testing membership here,
+    # for the drift reason above and one more: it is case-insensitive (the
+    # rejection echoes the id that was sent, and casing has no meaning in these
+    # ids) AND effort-insensitive on a codex composite advertised set, where the
+    # id sent is the bare one and no advertised string matches it literally —
+    # a literal test would call every transient codex blip an entitlement wall.
+    if not model_is_unusable(rejected, list(available_models)):
         return None
     return rejected
 
@@ -1258,6 +1310,36 @@ def advertised_model_ids(entries: object) -> list[str]:
     return ids
 
 
+def _advertised_is_codex_composite(ids: Sequence[str]) -> bool:
+    """Whether *ids* is codex-acp's per-effort composite advertisement.
+
+    Recognized by SHAPE, not by a backend flag, because the membership predicate
+    is shared with call sites that hold only the list (the warm-pool post-claim
+    check, ``resolve_usable_model``). Both conditions must hold: every entry
+    carries a bracket suffix over a non-empty base, AND some base appears under
+    two different suffixes — which is exactly "one row per effort level" and
+    nothing else.
+
+    A kiro or claude set never satisfies that. It advertises bare ids next to the
+    ``[1m]`` window variants, so the "every entry is suffixed" half already fails,
+    and there the suffix is a capability marker distinguishing real entitlements
+    that must stay significant in this comparison.
+    """
+    bases: dict[str, set[str]] = {}
+    for raw in ids:
+        value = raw.strip()
+        if not value:
+            continue
+        match = _CODEX_MODEL_EFFORT_SUFFIX_RE.search(value)
+        if not match:
+            return False
+        base = value[: match.start()].strip().lower()
+        if not base:
+            return False
+        bases.setdefault(base, set()).add(match.group(1).strip().lower())
+    return any(len(suffixes) > 1 for suffixes in bases.values())
+
+
 def model_is_unusable(model_id: str, advertised: Sequence[str] | None) -> bool:
     """True when *advertised* is known and excludes *model_id*.
 
@@ -1282,11 +1364,27 @@ def model_is_unusable(model_id: str, advertised: Sequence[str] | None) -> bool:
     namespaces would call every legitimate model unusable; that backend
     announces its own substitutions through the ``session/new`` advisory
     instead (see ``_new_session_following_substitution``).
+
+    On a codex-shaped advertised set the comparison is effort-INSENSITIVE: the
+    adapter advertises ``<model>[<effort>]`` per level but accepts only the bare
+    id on the model push, so the value this session actually runs (and stores)
+    matches no advertised string literally. Comparing bases there keeps a served
+    model usable in both spellings while an id whose base is unknown still fails.
+    Applied only to the shape in :func:`_advertised_is_codex_composite`, so
+    kiro/claude ``[1m]`` entitlements keep their exact-match semantics.
     """
     if not advertised:
         return False
+    ids = [m for m in advertised if m and m.strip()]
+    if not ids:
+        return False
     wanted = model_id.strip().lower()
-    return wanted not in {m.strip().lower() for m in advertised if m and m.strip()}
+    if wanted in {m.strip().lower() for m in ids}:
+        return False
+    if _advertised_is_codex_composite(ids):
+        base = codex_base_model_id(model_id).strip().lower()
+        return base not in {codex_base_model_id(m).strip().lower() for m in ids}
+    return True
 
 
 def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> str:
@@ -2655,6 +2753,15 @@ class AcpClient:
         """Switch model on a running session (used by warm pool post-claim)."""
         if not self._session_id:
             raise AcpError("Cannot set model before session is initialized")
+        if self._is_codex:
+            # Defensive floor for every caller: the codex wire takes the bare id,
+            # so a ``<model>[<effort>]`` composite is normalized here as well as
+            # at the dashboard's wire layer. The normalized value is what gets
+            # recorded below, which keeps a composite out of `_model` and off the
+            # startup re-apply path. The dropped suffix's effort is the CALLER's
+            # to route (the dashboard sends it as the slot's level right after
+            # this returns); pushing it from here would fight that push.
+            model_id = codex_base_model_id(model_id)
         # Unlike the spawn path, this is an explicit request for THIS model, so
         # a silent downgrade would report success while running something else.
         # Refuse before the wire and name what the account can use.
@@ -2718,7 +2825,16 @@ class AcpClient:
             return
         current_model_id = models.get("currentModelId")
         if isinstance(current_model_id, str) and current_model_id:
-            self._resolved_model_id = current_model_id
+            # codex names the current model in its ``<model>[<effort>]`` display
+            # form. Everything downstream of this field wants the plain model:
+            # the served_model reported to the dashboard, the usage rows, and the
+            # registry window lookup, none of which know the composite spelling.
+            # Normalize at the single point of record; the advertised LIST below
+            # keeps its composite entries, because those are what the picker
+            # offers and how an effort level is chosen.
+            self._resolved_model_id = (
+                codex_base_model_id(current_model_id) if self._is_codex else current_model_id
+            )
         advertised = models.get("availableModels")
         if not isinstance(advertised, list):
             return
@@ -2791,6 +2907,15 @@ class AcpClient:
         if not self._model or self._model == DEFAULT_MODEL:
             logger.info("ACP model: %s (from agent config)", self._model or "auto")
             return
+        startup_effort = ""
+        if self._is_codex:
+            # This is exactly the path a persisted ``<model>[<effort>]`` composite
+            # travels: every respawn and every resume re-applies the stored value,
+            # so an un-normalized one fails init forever rather than once. Rewrite
+            # `_model` (not just the pushed value) so the session reports the id it
+            # actually runs, and keep the suffix's effort so it is not lost with it.
+            startup_effort = codex_model_effort_suffix(self._model)
+            self._model = codex_base_model_id(self._model)
         if self._is_kiro and self._model_is_unusable(self._model):
             _withheld_log, _ = redact_exfiltration_urls(str(self._model))
             _withheld_log, _ = redact_credentials(_withheld_log)
@@ -2808,23 +2933,82 @@ class AcpClient:
             self._model = DEFAULT_MODEL
             return
         if self._is_spec_adapter:
-            # An adapter build that advertises no `model` config option would
-            # reject the call with -32602 and fail session startup for a
-            # setting the backend cannot honor — stay on its default instead.
-            if self._is_codex and not self.supports_config_option("model"):
-                logger.info(
-                    "ACP model %s requested but the codex adapter advertises no "
-                    "'model' config option; staying on the backend default.",
-                    self._model,
-                )
-                return
-            await self.set_config_option("model", self._model)
+            if self._is_codex:
+                if not await self._apply_codex_startup_model(startup_effort):
+                    return
+            else:
+                await self.set_config_option("model", self._model)
         else:
             await self._send_request(
                 METHOD_SET_MODEL,
                 {"sessionId": self._session_id, "modelId": self._model},
             )
         logger.info("ACP model: %s", self._model)
+
+    async def _apply_codex_startup_model(self, effort: str) -> bool:
+        """Push the stored model — and any effort its id carried — to a codex session.
+
+        Returns False when the session stays on the backend default. Two ways
+        that happens, and NEITHER may fail the handshake: the adapter advertises
+        no ``model`` config option (a build that cannot honor the setting would
+        answer -32602 and kill startup for it), or it refuses the value. The
+        model here was not chosen for this turn and is re-applied at EVERY init,
+        so raising would brick the session on every respawn rather than once —
+        warning and running the backend's own default is self-healing. ``_model``
+        is recorded as the default for the same reason the withheld path does it:
+        the warm-pool re-apply reads that ``!= DEFAULT_MODEL`` test and would
+        otherwise re-offer the refused id on every claim.
+        """
+        if not self.supports_config_option("model"):
+            logger.info(
+                "ACP model %s requested but the codex adapter advertises no "
+                "'model' config option; staying on the backend default.",
+                self._model,
+            )
+            return False
+        try:
+            await self.set_config_option("model", self._model)
+        except AcpError as exc:
+            _refused_log, _ = redact_exfiltration_urls(str(self._model))
+            _refused_log, _ = redact_credentials(_refused_log)
+            logger.warning(
+                "The codex adapter refused model %s (%s); staying on the backend default %s",
+                _refused_log,
+                exc,
+                self._resolved_model_id or DEFAULT_MODEL,
+            )
+            self._model = DEFAULT_MODEL
+            return False
+        if effort:
+            await self._apply_codex_startup_effort(effort)
+        return True
+
+    async def _apply_codex_startup_effort(self, effort: str) -> None:
+        """Carry a composite model id's effort level onto the fresh session.
+
+        The stored model can be codex's ``<model>[<effort>]`` form, where the
+        suffix IS how a level was picked (the adapter advertises one entry per
+        level), so stripping it for the model push must not also drop the choice.
+        Pushed only when THIS session's ``effort`` options list the level, so a
+        level the current model does not offer is not sent as a wire error.
+
+        Deliberately ordered BEFORE ``AcpProvider._apply_initial_effort``, which
+        runs after ``ensure_ready`` and overrides this whenever a slot or config
+        level resolves — that setting is the more explicit one. This only fills
+        the gap where nothing else resolves. Best-effort: a refusal leaves the
+        model's own default effort, which is not worth failing startup over.
+        """
+        if effort not in self.get_valid_effort_levels():
+            logger.debug(
+                "codex effort %r from the model id is not among this session's levels; skipping",
+                effort,
+            )
+            return
+        try:
+            await self.set_config_option("effort", effort)
+            logger.info("ACP effort %s (from the codex model id)", effort)
+        except AcpError as exc:
+            logger.warning("The codex adapter refused effort %s (%s)", effort, exc)
 
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level) via session/set_config_option."""

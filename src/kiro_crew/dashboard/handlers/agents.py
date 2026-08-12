@@ -726,10 +726,13 @@ def _advertised_alt_backend_models(request: web.Request) -> list[dict]:
     """Picker rows for a non-kiro ``agent.acp_backend``, from its live session.
 
     An alternate ACP adapter (codex) has no ``--list-models`` catalog to shell
-    out to and no registry entry to translate through: the ids it advertises in
-    its own ``session/new`` response ARE the wire values, which is exactly what
-    ``_wire_model_id``'s codex branch passes back to ``set_model``. So the
-    advertised list is both the only source and the authoritative one.
+    out to and no registry entry to translate through, so the ids it advertises in
+    its own ``session/new`` response are both the only source and the
+    authoritative one. They are NOT the wire values, though: codex advertises one
+    composite ``<model>[<effort>]`` entry per effort level, and the rows are served
+    verbatim so the picker can express that choice, while ``_wire_model_id``'s
+    codex branch splits the row it gets back — the bare model onto ``set_model``,
+    the effort suffix onto the effort config option.
 
     Newest session first, for the same reason as :func:`_entitled_kiro_models`:
     an older session holds the snapshot its own ``session/new`` captured.

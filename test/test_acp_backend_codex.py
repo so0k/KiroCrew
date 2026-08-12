@@ -700,6 +700,252 @@ class TestCodexModelApplication:
             await client.set_model("gpt-5-codex")
 
 
+class TestCodexEffortSuffixNeverReachesTheWire:
+    """``<model>[<effort>]`` is what codex-acp ADVERTISES, never what it accepts.
+
+    Verified live: the adapter advertises one ``availableModels`` entry per effort
+    level and the picker POSTs one verbatim, yet the ``model`` push takes only the
+    bare id — ``{"model": "gpt-5.6-sol"}`` was acked on the very session that had
+    answered ``gpt-5.6-sol[medium]`` with -32602. Because the value is re-applied
+    at every session init, one composite bricks a slot: each respawn fails the
+    same way. So the composite is split at the client floor as well as at the
+    dashboard's wire layer, and the suffix is routed to the effort option.
+    """
+
+    @staticmethod
+    def _client(tmp_path: Path, backend: str) -> AcpClient:
+        client = AcpClient(work_dir=tmp_path, acp_backend=backend)
+        client._session_id = "sess-1"
+        client._acp_config_options = [{"id": "model", "options": []}]
+        return client
+
+    def test_base_id_strips_only_a_trailing_bracket_group(self) -> None:
+        from kiro_crew.acp.client import codex_base_model_id
+
+        assert codex_base_model_id("gpt-5.6-sol[medium]") == "gpt-5.6-sol"
+        assert codex_base_model_id("gpt-5.6-terra[ultra] ") == "gpt-5.6-terra"
+        assert codex_base_model_id("gpt-5.6-sol") == "gpt-5.6-sol"
+        assert codex_base_model_id("") == ""
+        # Nothing but a suffix leaves no bare id to recover; the backend's own
+        # rejection should name the real value.
+        assert codex_base_model_id("[medium]") == "[medium]"
+
+    @pytest.mark.asyncio
+    async def test_set_model_pushes_the_bare_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(tmp_path, ACP_BACKEND_CODEX)
+        pushed: list[tuple[str, str]] = []
+
+        async def _record(config_id: str, value: str) -> None:
+            pushed.append((config_id, value))
+
+        monkeypatch.setattr(client, "set_config_option", _record)
+        await client.set_model("gpt-5.6-sol[medium]")
+        assert pushed == [("model", "gpt-5.6-sol")]
+        # Recorded bare too, so the startup re-apply and the warm-pool claim
+        # cannot resurrect the composite.
+        assert client._model == "gpt-5.6-sol"
+        assert client._resolved_model_id == "gpt-5.6-sol"
+
+    @pytest.mark.asyncio
+    async def test_startup_model_pushes_the_bare_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(tmp_path, ACP_BACKEND_CODEX)
+        client._model = "gpt-5.6-sol[medium]"
+        pushed: list[tuple[str, str]] = []
+
+        async def _record(config_id: str, value: str) -> None:
+            pushed.append((config_id, value))
+
+        monkeypatch.setattr(client, "set_config_option", _record)
+        await client._apply_startup_model()
+        assert pushed == [("model", "gpt-5.6-sol")]
+        assert client._model == "gpt-5.6-sol"
+
+    @pytest.mark.asyncio
+    async def test_kiro_bracket_suffix_is_preserved(self, tmp_path: Path) -> None:
+        # `[1m]` is a kiro CAPABILITY marker (the 1M-token window), part of the id
+        # the wire expects — normalizing it would silently switch windows.
+        client = self._client(tmp_path, "")
+        client._available_models = [{"modelId": "global.anthropic.claude-opus-4-8[1m]"}]
+        sent: list[dict[str, Any]] = []
+
+        async def _record(method: str, params: dict[str, Any]) -> int:
+            sent.append(params)
+            return 1
+
+        client._send_request = _record  # type: ignore[method-assign]
+        await client.set_model("global.anthropic.claude-opus-4-8[1m]")
+        assert sent == [{"sessionId": "sess-1", "modelId": "global.anthropic.claude-opus-4-8[1m]"}]
+        assert client._model == "global.anthropic.claude-opus-4-8[1m]"
+
+    def test_effort_suffix_reads_the_level_out_of_a_composite(self) -> None:
+        from kiro_crew.acp.client import codex_model_effort_suffix
+
+        assert codex_model_effort_suffix("gpt-5.6-sol[medium]") == "medium"
+        # codex offers a level the canonical five do not have.
+        assert codex_model_effort_suffix("gpt-5.6-sol[ultra] ") == "ultra"
+        assert codex_model_effort_suffix("gpt-5.6-sol") == ""
+        assert codex_model_effort_suffix("gpt-5.6-sol[]") == ""
+        # No model to pair the level with — codex_base_model_id keeps this whole,
+        # so reporting a level here would split one value into two claims.
+        assert codex_model_effort_suffix("[medium]") == ""
+
+    @pytest.mark.asyncio
+    async def test_startup_carries_the_suffix_onto_the_effort_option(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The suffix IS how the level was picked (one advertised entry per level),
+        # so stripping it for the model push must not drop the choice.
+        client = self._client(tmp_path, ACP_BACKEND_CODEX)
+        client._model = "gpt-5.6-sol[ultra]"
+        client._acp_config_options = [
+            {"id": "model", "options": []},
+            {"id": "effort", "options": [{"value": "low"}, {"value": "ultra"}]},
+        ]
+        pushed: list[tuple[str, str]] = []
+
+        async def _record(config_id: str, value: str) -> None:
+            pushed.append((config_id, value))
+
+        monkeypatch.setattr(client, "set_config_option", _record)
+        await client._apply_startup_model()
+        # Model first, then effort — the provider's own initial-effort push runs
+        # after ensure_ready and still overrides this when a slot level resolves.
+        assert pushed == [("model", "gpt-5.6-sol"), ("effort", "ultra")]
+
+    @pytest.mark.asyncio
+    async def test_startup_skips_a_level_this_session_does_not_offer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(tmp_path, ACP_BACKEND_CODEX)
+        client._model = "gpt-5.6-sol[ultra]"
+        client._acp_config_options = [
+            {"id": "model", "options": []},
+            {"id": "effort", "options": [{"value": "low"}]},
+        ]
+        pushed: list[tuple[str, str]] = []
+
+        async def _record(config_id: str, value: str) -> None:
+            pushed.append((config_id, value))
+
+        monkeypatch.setattr(client, "set_config_option", _record)
+        await client._apply_startup_model()
+        # A level the model does not offer would only earn a wire error.
+        assert pushed == [("model", "gpt-5.6-sol")]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_startup_model_warns_instead_of_failing_the_handshake(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A persisted model the adapter will not take must be self-healing: the
+        # value was not chosen for this turn and is re-applied at EVERY init, so
+        # raising would kill every respawn rather than one call.
+        client = self._client(tmp_path, ACP_BACKEND_CODEX)
+        client._model = "gpt-9-imaginary"
+        client._resolved_model_id = "gpt-5.6-sol"
+
+        async def _refuse(config_id: str, value: str) -> None:
+            raise AcpError("Invalid params: unknown model")
+
+        monkeypatch.setattr(client, "set_config_option", _refuse)
+        await client._apply_startup_model()
+        # Recorded as the backend default so the warm-pool re-apply (which reads
+        # `!= DEFAULT_MODEL`) stops re-offering the refused id on every claim.
+        assert client._model == client_mod.DEFAULT_MODEL
+
+    def test_current_model_id_is_recorded_bare(self, tmp_path: Path) -> None:
+        # served_model, the usage rows and the registry window lookup all key on
+        # the plain model; none of them knows the composite spelling.
+        client = self._client(tmp_path, ACP_BACKEND_CODEX)
+        client._capture_available_models(
+            {
+                "models": {
+                    "currentModelId": "gpt-5.6-sol[medium]",
+                    "availableModels": [
+                        {"modelId": "gpt-5.6-sol[low]", "name": "GPT-5.6-Sol (low)"},
+                        {"modelId": "gpt-5.6-sol[medium]", "name": "GPT-5.6-Sol (medium)"},
+                    ],
+                }
+            }
+        )
+        assert client._resolved_model_id == "gpt-5.6-sol"
+        # The advertised list keeps its composite rows: that is what the picker
+        # offers and how an effort level gets chosen.
+        assert [m["modelId"] for m in client.available_models()] == [
+            "gpt-5.6-sol[low]",
+            "gpt-5.6-sol[medium]",
+        ]
+
+    def test_kiro_current_model_id_is_recorded_verbatim(self, tmp_path: Path) -> None:
+        client = self._client(tmp_path, "")
+        client._capture_available_models(
+            {"models": {"currentModelId": "global.anthropic.claude-opus-4-8[1m]"}}
+        )
+        assert client._resolved_model_id == "global.anthropic.claude-opus-4-8[1m]"
+
+
+class TestCodexCompositeEntitlementMembership:
+    """A bare id must pass the entitlement check against a composite advertised set.
+
+    The adapter accepts only the bare id, so that is what a slot stores after a
+    switch or a rollback — and it matches no advertised string literally. Without
+    an effort-insensitive comparison the warm-pool post-claim check would call the
+    running model unentitled and silently decline to re-apply it.
+    """
+
+    CODEX_ADVERTISED = [
+        "gpt-5.6-sol[low]",
+        "gpt-5.6-sol[medium]",
+        "gpt-5.6-sol[high]",
+        "gpt-5.6-sol[ultra]",
+    ]
+
+    def test_the_bare_accepted_id_is_usable(self) -> None:
+        assert not client_mod.model_is_unusable("gpt-5.6-sol", self.CODEX_ADVERTISED)
+
+    def test_a_composite_id_is_usable(self) -> None:
+        # The spelling the picker sends is still a real model.
+        assert not client_mod.model_is_unusable("gpt-5.6-sol[medium]", self.CODEX_ADVERTISED)
+        # Including an effort this set does not list: the MODEL is entitled, and
+        # effort validity is the effort option's business, not entitlement's.
+        assert not client_mod.model_is_unusable("gpt-5.6-sol[xhigh]", self.CODEX_ADVERTISED)
+
+    def test_an_unknown_model_still_fails(self) -> None:
+        assert client_mod.model_is_unusable("made-up-model", self.CODEX_ADVERTISED)
+        assert client_mod.model_is_unusable("made-up-model[low]", self.CODEX_ADVERTISED)
+
+    def test_kiro_capability_suffix_keeps_exact_match(self) -> None:
+        # `[1m]` distinguishes real entitlements (the 1M-token window), so the
+        # bare id is NOT interchangeable with it. Unchanged from before the codex
+        # split existed — the widening is gated on the composite shape.
+        assert client_mod.model_is_unusable("claude-opus-4-8", ["claude-opus-4-8[1m]"])
+        assert not client_mod.model_is_unusable("claude-opus-4-8[1m]", ["claude-opus-4-8[1m]"])
+        assert client_mod.model_is_unusable(
+            "claude-opus-4-8[1m]", ["claude-opus-4-8", "claude-sonnet-4-6"]
+        )
+
+    def test_a_kiro_set_is_not_read_as_codex_shaped(self) -> None:
+        # A kiro list advertises bare ids next to the window variants, so the
+        # "every entry suffixed" half of the shape test fails outright.
+        kiro = ["auto", "claude-opus-4-8", "claude-opus-4-8[1m]", "gpt-5.6-sol"]
+        assert not client_mod._advertised_is_codex_composite(kiro)
+        assert client_mod._advertised_is_codex_composite(self.CODEX_ADVERTISED)
+        # One entry per model is not the per-effort shape either: nothing proves
+        # the suffix is an effort rather than a capability.
+        assert not client_mod._advertised_is_codex_composite(["gpt-5.6-sol[low]"])
+
+    def test_resolve_usable_model_keeps_the_bare_id_on_a_codex_set(self) -> None:
+        # The non-explicit resolver shares the predicate, so a background caller
+        # inheriting the bare id no longer falls back to the backend default.
+        assert (
+            client_mod.resolve_usable_model("gpt-5.6-sol", self.CODEX_ADVERTISED) == "gpt-5.6-sol"
+        )
+        assert client_mod.resolve_usable_model("made-up-model", self.CODEX_ADVERTISED) == ""
+
+
 class TestCodexAuthClassification:
     """An expired ChatGPT session dies mid-handshake; it must read as auth, not error."""
 
@@ -786,6 +1032,28 @@ class TestDashboardModelPlumbing:
         # No codex id means "let the backend choose", so Auto needs a reset ("").
         assert _wire_model_id(provider, "auto") == ""
         assert _wire_model_id(provider, "") == ""
+
+    def test_wire_model_id_splits_off_the_effort_suffix(self, tmp_path: Path) -> None:
+        # The adapter's `<model>[<effort>]` state spelling is not a legal `model`
+        # push (-32602). Effort rides its own config option, which
+        # _reapply_effort_after_live_switch sends right after the model switch.
+        from kiro_crew.dashboard.chat_handlers import _wire_model_id
+
+        provider = AcpProvider(work_dir=tmp_path, acp_backend=ACP_BACKEND_CODEX)
+        assert _wire_model_id(provider, "gpt-5.6-sol[medium]") == "gpt-5.6-sol"
+
+    def test_wire_model_id_keeps_the_kiro_capability_suffix(self, tmp_path: Path) -> None:
+        # The split is codex-scoped: a kiro `[1m]` id IS the wire id.
+        from kiro_crew import model_registry
+        from kiro_crew.dashboard.chat_handlers import _wire_model_id
+
+        kiro = AcpProvider(work_dir=tmp_path, acp_backend="")
+        wire = _wire_model_id(kiro, "claude-opus-4.8")
+        assert wire == model_registry.to_acp_id("claude-opus-4.8")
+        assert _wire_model_id(kiro, "claude-opus-4-8[1m]") == model_registry.to_acp_id(
+            "claude-opus-4-8[1m]"
+        )
+        assert "[1m]" in _wire_model_id(kiro, "claude-opus-4-8[1m]")
 
     def test_pinned_model_is_never_withheld_on_codex(self, tmp_path: Path) -> None:
         # The withhold check compares against kiro-advertised ids; a codex id

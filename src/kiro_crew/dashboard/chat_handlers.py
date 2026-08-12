@@ -20,7 +20,11 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
-from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.acp.client import (
+    AcpModelUnavailable,
+    codex_base_model_id,
+    codex_model_effort_suffix,
+)
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -2549,7 +2553,10 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
     warm-pool post-claim switch does in ``SessionManager``: kiro wants the bare
     dotted id via ``to_acp_id`` (which translates canonical keys and passes
     kiro's own ids through unchanged), the claude backend wants the
-    ``global.anthropic.*`` id, and codex wants its advertised id verbatim.
+    ``global.anthropic.*`` id, and codex wants the BARE half of its advertised
+    id: it advertises one composite ``<model>[<effort>]`` entry per effort level
+    but accepts only the bare model on the push, with the effort level travelling
+    on its own config option (see ``_adopt_codex_effort_pick``).
 
     Returns "" when the change cannot be expressed as a ``set_model`` on this
     backend, which tells the caller to fall back to a session reset.
@@ -2565,13 +2572,64 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
         # codex ids are the adapter's own advertised ids — no registry entry to
         # translate through. Like claude, it has no id meaning "server default",
         # so returning to default needs a reset.
-        return "" if is_default else model_name
+        #
+        # The picker POSTs an advertised entry verbatim, and those are composite:
+        # ``<model>[<effort>]``, one per level. Only the bare model is a legal
+        # ``model`` push (the composite is answered with -32602), so the suffix
+        # comes off here and is routed to the effort option instead — see
+        # ``_adopt_codex_effort_pick``, which records it as the slot's level for
+        # ``_reapply_effort_after_live_switch`` to push right after the switch.
+        return "" if is_default else codex_base_model_id(model_name)
     if is_default:
         # kiro DOES express Auto as a real model id — but only switch to it when
         # this session's backend actually advertised it.
         advertised = {m.get("modelId", "") for m in provider.available_models()}
         return "auto" if "auto" in advertised else ""
     return model_registry.to_acp_id(model_name)
+
+
+def _adopt_codex_effort_pick(
+    name: str, slot: _ChatSlot, provider: AcpProvider, model_name: str
+) -> None:
+    """Record the effort level a codex composite pick carried, as the slot's level.
+
+    The codex picker rows for one model differ ONLY by their ``[<effort>]``
+    suffix, so the row the user clicked expresses both halves of the choice while
+    the wire takes them on two separate config options. Storing the level here is
+    what makes the two halves land: ``_reapply_effort_after_live_switch`` (called
+    next) pushes it to the running session, and the persisted slot value re-applies
+    it at the next cold start through ``AcpProvider._apply_initial_effort``.
+
+    Validated against the levels THIS session reports — not the canonical five —
+    because codex advertises an extra ``ultra`` that a canonical clamp would drop
+    on the floor. An absent or unrecognized suffix leaves the slot untouched, so a
+    bare-id pick keeps whatever level the slot already had, exactly as before.
+
+    The session list is raw adapter output, so the level must ALSO be one the
+    effort endpoint would accept (``get_reasoning_effort_values``, the sanitized
+    set that every session's advertised levels are unioned into). That is what
+    keeps an unsanitized value out of the persisted slot, and it is not a clamp:
+    the set grows with whatever levels the backends report.
+    """
+    suffix = codex_model_effort_suffix(model_name)
+    if not suffix or suffix == slot.reasoning_effort:
+        return
+    try:
+        levels = provider.get_valid_effort_levels()
+    except Exception:  # pragma: no cover - a config read must not fail the switch
+        return
+    if suffix not in levels or suffix not in get_reasoning_effort_values():
+        logger.info(
+            "Slot %s: effort %r from the codex model pick is not an accepted "
+            "level (session advertises %s) — keeping %r",
+            name,
+            suffix,
+            levels,
+            slot.reasoning_effort or "default",
+        )
+        return
+    slot.reasoning_effort = suffix
+    logger.info("Slot %s reasoning_effort %r adopted from the codex model pick", name, suffix)
 
 
 async def _reapply_effort_after_live_switch(
@@ -2598,9 +2656,12 @@ async def _reapply_effort_after_live_switch(
             return bool(await provider.change_effort(slot.reasoning_effort))
         # No slot override: re-resolve so a workspace default reaches the new
         # model, matching what a respawn's overlay would have written. A False
-        # return is benign HERE, unlike in the effort endpoint: it means there
-        # was no default to push, and since the user never set a level for THIS
-        # model there is nothing stale on the session to undo either.
+        # return is benign HERE, unlike in the effort endpoint: it means no level
+        # was pushed, and since the user never set one for THIS model there is
+        # nothing stale on the session to undo either. On a spec adapter (claude,
+        # codex) that is the ONLY outcome — ``clear_effort`` has no "reset to
+        # default" value to send, so it returns False having touched no wire and
+        # the new model simply runs at its own default effort.
         await provider.clear_effort()
         return True
     except Exception as exc:
@@ -2612,6 +2673,18 @@ async def _reapply_effort_after_live_switch(
             exc,
         )
         return False
+
+
+class _LiveModelSwitchRejected(Exception):
+    """A live, responsive session refused a ``set_model`` push.
+
+    Distinct from "the call didn't land": the process is still alive and still
+    running the previous model, so the value itself is what the backend would not
+    take. Resetting on it would destroy the conversation and then re-apply the
+    same value at cold start, which fails again — on the codex path every
+    subsequent init too, since the startup re-apply reads the persisted value.
+    The handler therefore rolls the slot back and answers 4xx instead.
+    """
 
 
 async def _try_live_model_switch(
@@ -2631,6 +2704,10 @@ async def _try_live_model_switch(
     must fall back to a reset — including when there is no live session at all,
     where the reset is an O(1) no-op teardown but still routes through
     ``_reset_slot_session``'s pending-wait cleanup.
+
+    Raises ``_LiveModelSwitchRejected`` when a still-alive session refused the
+    push, so the caller can avoid persisting a value the backend will reject on
+    every later init (see that exception).
     """
     if not isinstance(provider, AcpProvider):
         return False
@@ -2652,14 +2729,31 @@ async def _try_live_model_switch(
         # Propagate so the handler answers 4xx and the slot keeps its old model.
         raise
     except Exception as exc:
+        # A dead/exited process is the one case where the reset IS the recovery:
+        # nothing evaluated the value, and the cold start applies it cleanly. A
+        # session that is still alive evaluated it and said no, so the value must
+        # not be kept — see _LiveModelSwitchRejected.
+        alive = True
+        try:
+            alive = bool(provider.is_process_alive())
+        except Exception:  # pragma: no cover - a probe failure is not a verdict
+            pass
         logger.warning(
-            "Live set_model(%s) failed for slot %s: %s: %s — falling back to reset",
+            "Live set_model(%s) failed for slot %s: %s: %s — %s",
             wire,
             name,
             type(exc).__name__,
             exc,
+            "rejecting the pick" if alive else "falling back to reset",
         )
+        if alive:
+            raise _LiveModelSwitchRejected(str(exc)) from exc
         return False
+    if provider.is_codex_backend:
+        # Only after the model landed: the pick's effort half is worthless if the
+        # model half was refused, and the session re-advertises its effort levels
+        # for the new model, so this validates against the right list.
+        _adopt_codex_effort_pick(name, slot, provider, model_name)
     if not await _reapply_effort_after_live_switch(name, slot, provider):
         return False
     logger.info("Slot %s model switched live to %r (session preserved)", name, wire)
@@ -2695,7 +2789,14 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
 
     Prefers an in-place ``session/set_model`` on the running session and only
     resets when that is impossible (no ACP provider, a turn in flight, an
-    unrepresentable target, or the live call failing).
+    unrepresentable target, or a session whose process has exited).
+
+    A live session that REFUSES the pick answers 4xx with the slot rolled back:
+    persisting a value the backend rejected would re-send it at every later init.
+
+    A codex pick can also move the slot's reasoning effort, because that backend's
+    picker rows carry it in the model id (``_adopt_codex_effort_pick``); the
+    slots-update broadcast below is what tells the UI about it.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -2729,6 +2830,13 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         slot.model = prior_model
         logger.warning("Slot %s model rejected: %s", name, exc)
         return web.json_response({"error": str(exc), "code": "model_unavailable"}, status=400)
+    except _LiveModelSwitchRejected as exc:
+        # Same rollback for the same reason, one class wider: a live session that
+        # refused the push leaves the slot on a value no init will accept, and the
+        # startup re-apply re-sends it on every respawn — the poisoned-slot loop.
+        # Only a value the backend accepted (or never evaluated) may be persisted.
+        slot.model = prior_model
+        return web.json_response({"error": str(exc), "code": "model_switch_failed"}, status=400)
     if went_live:
         _broadcast_context_reset(state, slot.key, provider)
     else:
