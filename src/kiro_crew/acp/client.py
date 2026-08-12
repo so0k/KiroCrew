@@ -33,7 +33,7 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterator, Sequence
 
-from kiro_crew import model_registry, platform_compat
+from kiro_crew import agent_discovery, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
@@ -99,6 +99,12 @@ from kiro_crew.acp.types import (
     TurnUsage,
 )
 from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.agent_discovery import (
+    _project_agent_fallback_name,
+    _read_agent_spec,
+    project_agent_files,
+    spec_str,
+)
 from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
 from kiro_crew.config.paths import kiro_agents_dir, kiro_sessions_dir
 from kiro_crew.constants import (
@@ -110,6 +116,7 @@ from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import (
     HOOK_EVENT_POST_TOOL_USE,
+    MAX_FILE_BYTES,
     fire_tool_hooks,
     get_global_hook_store,
 )
@@ -1894,7 +1901,252 @@ def _select_tool_title(title: object, raw_input: object) -> str | None:
     return None
 
 
-def _spec_adapter_shell_restriction(agent: str) -> str | None:
+# The names an agent spec's ``tools`` list grants the builtin shell tool under.
+# All three are kiro-cli's own tools semantics, NOT something this repo
+# implements — the spec file is handed to kiro-cli verbatim and no code here
+# expands a ``tools`` list:
+#   - ``"*"``: the spec template ``kiro-cli agent create`` writes carries
+#     ``"tools": ["*"]``, so the wildcard is the backend's own canonical
+#     "every tool", shell included.
+#   - ``execute_bash`` and ``shell``: kiro-cli versions name the same shell
+#     builtin either way, which is why ``agent._strip_legacy_denied_commands``
+#     has to iterate BOTH keys of a spec's ``toolsSettings`` to find the shell
+#     entry. Independently of parser vintage, an author who lists ``shell``
+#     intends to grant shell, so reading either name as a grant matches intent.
+# This set is therefore the guard's MODEL of what the backend grants, and the
+# model errs permissive: a list carrying any of the three reads as a shell
+# grant, so widening it beyond the names kiro-cli honors permits sessions that
+# are in fact restricted.
+_SHELL_GRANTING_TOOL_NAMES: frozenset[str] = frozenset({"execute_bash", "shell", "*"})
+
+
+def _agent_tools_grant_shell(tools: list[Any]) -> bool:
+    """Whether a kiro agent ``tools`` allowlist grants the builtin shell tool."""
+    return any(isinstance(entry, str) and entry in _SHELL_GRANTING_TOOL_NAMES for entry in tools)
+
+
+def _agent_spec_over_read_cap(path: Path) -> bool:
+    """Whether *path* is too large for the hardened agent-spec reader.
+
+    ``agent_discovery._read_agent_spec`` drops such a file (it reads through
+    ``hooks.safe_read_file_bytes``, capped at ``MAX_FILE_BYTES``). The cap is
+    Kiro Crew's own reader policy and kiro-cli applies none, so an oversized
+    spec still applies its ``tools`` list there and the guard must treat it as
+    unverifiable rather than as absent. Stat-only, so asking the question does
+    not perform the unbounded read the cap exists to prevent.
+    """
+    try:
+        return path.stat().st_size > MAX_FILE_BYTES
+    except OSError:
+        return False
+
+
+def _agent_spec_sensitive_target(path: Path) -> bool:
+    """Whether *path* resolves into a tree the hardened agent-spec reader refuses.
+
+    ``agent_discovery._read_agent_spec`` drops a spec whose RESOLVED target is
+    sensitive (``evil.json`` -> ``~/.aws/credentials``). Like the read cap, that
+    is Kiro Crew's own reader policy: kiro-cli applies no such filter, so the
+    file is still activatable there with whatever ``tools`` list it declares,
+    and the guard must treat it as unverifiable rather than as absent.
+
+    Asked through the reader's OWN ``is_sensitive_path`` binding so the two can
+    never disagree on which paths are sensitive, and it only resolves the link,
+    never opens the target.
+    """
+    try:
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        # Missing file, broken link, or (RuntimeError) a symlink loop. kiro-cli
+        # cannot activate any of those either, so they are not this predicate's
+        # refusal to make.
+        return False
+    return bool(agent_discovery.is_sensitive_path(str(real)))
+
+
+def _agent_spec_unverifiable_reason(path: Path) -> str:
+    """Why *path* is dispatchable on kiro-cli yet unreadable here.
+
+    Only the two reader refusals kiro-cli does NOT share reach this: a
+    sensitive resolved target and the read cap. Both are re-derived here rather
+    than threaded through the candidate list, because only the refusal path
+    needs to tell them apart and both checks are stat-only.
+    """
+    if _agent_spec_sensitive_target(path):
+        return (
+            f"{path} resolves into a sensitive tree, so whether its tools list "
+            "withholds shell cannot be verified — kiro-cli applies no such filter "
+            "and would honor the restriction"
+        )
+    return (
+        f"{path} exceeds the {MAX_FILE_BYTES // (1024 * 1024)} MB agent-config read "
+        "cap, so whether its tools list withholds shell cannot be verified — "
+        "kiro-cli applies no such cap and would honor the restriction"
+    )
+
+
+def _spec_adapter_agent_candidate(
+    spec: Path, agent: str
+) -> tuple[Path, dict[str, Any] | None] | None:
+    """*spec* paired with its body when ``--agent <agent>`` can dispatch to it.
+
+    The match is on the name the spec is dispatchable UNDER — a declared
+    ``name`` wins over the filename stem — because that is the name ``--agent``
+    accepts, and it is the same computation ``agent_discovery`` makes in BOTH
+    scopes — ``_project_agent_info`` for the project dispatch set and
+    ``_global_agent_info`` for the user-level one, each naming a spec
+    ``spec_str(data, "name", stem)``.
+
+    Reading goes through ``agent_discovery._read_agent_spec``, the hardened
+    reader behind those dispatch sets, and its refusals split two ways:
+
+    - Refusals kiro-cli SHARES — unparseable or non-object JSON, an
+      AppleDouble sidecar, a broken or looping symlink, a file the OS will not
+      hand over — mean the file cannot become a kiro mode there either, so
+      there is no restriction to honor and the candidate is DROPPED. Treating
+      it as the resolved config would report "nothing to verify" and permit a
+      session that the spec ``--agent`` actually resolves to restricts.
+    - Refusals that are this reader's own policy while kiro-cli WOULD activate
+      the file — over the read cap (kiro-cli caps nothing) and a sensitive
+      resolved target (kiro-cli filters nothing) — are returned with a body of
+      ``None`` so the caller refuses as unverifiable. This is the ONE branch
+      that cannot confirm the name: the name a spec is dispatchable under is its
+      declared ``name``, which lives in the body those refusals forbid reading,
+      so any such file in a scope's candidate set may well be dispatchable as
+      *agent* and is refused rather than dropped. Its filename stem is no
+      evidence either way — a namespaced ``<app>--<agent>.json`` declares a name
+      its stem does not repeat. The cost is a false refusal on a file that only
+      LOOKS unrelated while being simultaneously over the cap or
+      sensitive-targeted, and that is the deliberate fail-closed side: dropping
+      it grants the adapter's unrestricted shell for a spec whose withheld shell
+      kiro-cli would honor.
+    """
+    if _agent_spec_sensitive_target(spec) or _agent_spec_over_read_cap(spec):
+        return (spec, None)
+    data = _read_agent_spec(spec)
+    if data is None:
+        return None
+    if spec_str(data, "name", _project_agent_fallback_name(spec)) != agent:
+        return None
+    return (spec, data)
+
+
+def _spec_adapter_project_agent_candidates(
+    agent: str, project_dir: str | Path | None
+) -> list[tuple[Path, dict[str, Any] | None]]:
+    """Every project-local spec ``--agent <agent>`` can dispatch to, with its body.
+
+    Mirrors the backend's own resolution order: kiro-cli searches
+    ``<cwd>/.kiro/agents`` before the user-level directory (with no upward
+    walk), so a project-local spec SHADOWS a same-named user-level one
+    (``config.paths.project_agents_dir``, ``agent_discovery`` scopes).
+
+    ALL matches are returned, not just one, because two files in the same
+    project dir can declare the SAME name and neither the loader nor kiro-cli
+    offers a stable winner to mirror: ``agent_discovery.list_agents`` overwrites
+    ``seen[name]`` as it walks the stem-sorted project files, so its winner is
+    whichever file sorts last — an artifact of the sort, not a documented rule.
+    The caller resolves that tie fail-closed by refusing when ANY candidate
+    withholds shell.
+
+    Returns ``[]`` when the project declares no dispatchable spec for *agent*,
+    so the caller falls through to the user-level scope. Per-file name matching
+    and read hardening are :func:`_spec_adapter_agent_candidate`'s.
+
+    This scope reads and parses EVERY file in ``<project_dir>/.kiro/agents``,
+    with no filename narrowing: dispatch is on the declared ``name`` field, so
+    only a full scan is a complete match, and that dir holds the handful of
+    specs a checkout ships. The reads are not free — *project_dir* arrives from
+    a caller-supplied session field, which is why the per-file hardening (read
+    cap, sensitive resolved target) carries its own weight here — and the
+    handshake caller runs the whole scan through ``asyncio.to_thread``
+    (:meth:`AcpClient._assert_spec_adapter_agent_permitted`'s call site), so
+    none of this filesystem work lands on the event loop.
+    """
+    if not project_dir:
+        return []
+    candidates: list[tuple[Path, dict[str, Any] | None]] = []
+    for spec in project_agent_files(project_dir):
+        candidate = _spec_adapter_agent_candidate(spec, agent)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _spec_adapter_user_agent_candidates(agent: str) -> list[tuple[Path, dict[str, Any] | None]]:
+    """Every user-level spec ``--agent <agent>`` can dispatch to, with its body.
+
+    Mirrors the loader in the user scope the way the project scope does, and
+    for the same reason: kiro-cli dispatches a user-level agent by its JSON
+    ``name`` field, not by its filename (``agent_discovery._global_agent_info``
+    names every row ``spec_str(data, "name", f.stem)``), and the filenames in
+    that dir are routinely namespaced — an app materializes its agents as
+    ``<app>--<agent>.json`` (``apps.bridges._safe_link_name``) and a package
+    installs them as ``<Pkg>-<name>.json``. A filename-stem-only lookup
+    therefore misses exactly the specs an app or a package planted, reading a
+    restricted app agent's withheld shell as no restriction at all.
+
+    ``<agent>.json`` is checked first: the fast path for an unnamespaced spec,
+    and the only path for a name carrying glob metacharacters, which the scan
+    below cannot match literally. The scan is then narrowed to filenames ENDING
+    in the agent name, each confirmed against the authoritative ``name`` field —
+    the same bounded narrowing every other name-field lookup in-tree uses
+    (``mcp_gateway.session_servers._load_overlay_for_agent``,
+    ``dashboard.handlers.agents._namespaced_agent_file_exists``). It keeps the
+    check off a read of every spec in the USER dir, which every app and package
+    that materializes an agent writes into and which therefore holds far more
+    specs than a project dir (the project scope, where nothing can narrow, does
+    read all of its own). What the narrowing gives up is a spec whose filename
+    does not end in the ``name`` it declares — a shape no materializer in-tree produces (every
+    one of them suffixes the declared name), and one whose author could equally
+    have listed ``execute_bash``.
+
+    ALL matches are returned for the same reason the project scope returns all
+    of them: a bare ``<agent>.json`` and a namespaced file can declare one
+    ``name``, and ``list_agents`` picks between them on package preference and
+    first-seen order that no kiro-cli rule mirrors, so the caller resolves the
+    tie fail-closed.
+    """
+    agents_dir = kiro_agents_dir()
+    exact = agents_dir / f"{agent}.json"
+    try:
+        namespaced = sorted(agents_dir.glob(f"*{agent}.json"))
+    except (OSError, ValueError):
+        # ValueError: an agent name carrying glob metacharacters (``*`` ->
+        # ``**.json``) is an invalid pattern. The exact path is still inspected,
+        # so the file that name literally resolves to is never skipped.
+        namespaced = []
+    candidates: list[tuple[Path, dict[str, Any] | None]] = []
+    for spec in [exact] + [p for p in namespaced if p != exact]:
+        candidate = _spec_adapter_agent_candidate(spec, agent)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _agent_spec_withholds_shell(path: Path, data: dict[str, Any] | None) -> str | None:
+    """Why the resolved spec at *path* restricts shell, or ``None`` when it does not.
+
+    *data* is ``None`` for a spec this reader refuses while kiro-cli would still
+    activate it: the restriction can be neither confirmed nor ruled out here,
+    so it refuses (:func:`_agent_spec_unverifiable_reason`).
+    """
+    if data is None:
+        return _agent_spec_unverifiable_reason(path)
+    tools = data.get("tools")
+    if not isinstance(tools, list):
+        return None
+    if _agent_tools_grant_shell(tools):
+        return None
+    return (
+        f"{path} withholds shell access in its tools list (no execute_bash, "
+        "no shell, no '*' wildcard) — a deliberate shell-access restriction"
+    )
+
+
+def _spec_adapter_shell_restriction(
+    agent: str, project_dir: str | Path | None = None
+) -> str | None:
     """Return why *agent* cannot be safely activated on a spec adapter, or None.
 
     ``session/set_mode`` is the ONLY mechanism that applies a custom kiro
@@ -1902,19 +2154,61 @@ def _spec_adapter_shell_restriction(agent: str) -> str | None:
     of scope for Kiro Crew's own policy/profile ceiling, which does not
     substitute for it). A spec adapter (claude, codex) never sends
     ``set_mode`` and reads no kiro agent config at all, so an agent whose
-    ``~/.kiro/agents/<agent>.json`` deliberately omits ``execute_bash`` —
-    e.g. the shipped ``auto-improvement-pr-author`` (``"tools": []``), a
-    prose-only agent with no shell access on kiro-cli — would silently run
-    with the adapter's own unrestricted built-in shell tool instead, a
-    privilege escalation of exactly the kind the kiro-side ``set_mode``
-    guard (fail-closed on a missing mode, see the caller) exists to prevent.
+    config withholds shell access — e.g. the shipped
+    ``auto-improvement-pr-author`` (``"tools": []``), a prose-only agent with
+    no shell access on kiro-cli — would silently run with the adapter's own
+    unrestricted built-in shell tool instead, a privilege escalation of
+    exactly the kind the kiro-side ``set_mode`` guard (fail-closed on a
+    missing mode, see the caller) exists to prevent.
+
+    The config is resolved the way kiro-cli resolves ``--agent`` for this
+    session: *project_dir*'s ``.kiro/agents``
+    (:func:`_spec_adapter_project_agent_candidates`) shadows the user-level
+    agents dir (:func:`_spec_adapter_user_agent_candidates`), so the user scope
+    is consulted only when the project declares no dispatchable spec for the
+    name. Reading only the user-level dir would let a project-local
+    shell-withholding agent through unnoticed, and a project file the loader
+    cannot dispatch does not shadow the user-level spec this guard then reads.
+
+    In BOTH scopes a spec is matched on the name it is dispatchable under — a
+    declared ``name`` field wins over the filename stem — because that is what
+    ``--agent`` accepts. In the user scope that is not cosmetic: an app
+    materializes its agents as ``<app>--<agent>.json`` and a package installs
+    them as ``<Pkg>-<name>.json``, so a stem-only lookup would read every
+    app-installed and package-installed restricted profile as absent. In both
+    scopes EVERY matching candidate is inspected and any one withholding shell
+    refuses, because two files can declare the same name with no stable winner
+    to mirror.
+
+    Both scopes read through ``agent_discovery._read_agent_spec``. That is
+    blocking filesystem work: bounded per file by the reader's own cap, but
+    unbounded in file COUNT for the project scope, which reads every spec in
+    ``<project_dir>/.kiro/agents`` because name-field dispatch admits no
+    complete filename narrowing. The handshake caller therefore awaits the whole
+    scan through ``asyncio.to_thread`` and none of it runs on the event loop.
+    One hazard is inherited rather than fixed: a FIFO planted at a candidate
+    path blocks the reader's ``open`` until a writer appears, which off-loop
+    stalls this one handshake instead of the whole loop. That is a pre-existing
+    property of ``hooks.safe_read_file_bytes`` shared with its every caller.
+    Its refusals are honored
+    the way kiro-cli would see them: a spec it rejects for a reason kiro-cli
+    SHARES (unparseable JSON, a broken link) is not activatable there either, so
+    there is no restriction to honor and the candidate is skipped, while a spec
+    rejected by this reader's own policy — over the read cap, or a sensitive
+    resolved target, neither of which kiro-cli applies — stays activatable
+    there and refuses here as unverifiable rather than reading as absent.
+
+    "Withholds shell" means a ``tools`` list with none of
+    ``execute_bash`` / ``shell`` / ``"*"`` (:data:`_SHELL_GRANTING_TOOL_NAMES`),
+    matching how kiro-cli names that tool and expands the wildcard.
 
     Only a POSITIVE finding refuses: the default ``kirocrew`` agent, every
     managed agent Kiro Crew itself authors (``agent_files.OWNED_KIRO_AGENT_FILES``),
-    and any agent whose config cannot be read/parsed, has no ``tools`` key,
-    or already lists ``execute_bash``, return ``None`` (unchanged behavior) —
-    this stays a narrow, verifiable check, not a blanket ban on custom agents
-    under a spec adapter.
+    and any agent whose config is missing, unparseable, has no ``tools`` key,
+    or grants shell, return ``None`` — this stays a narrow, verifiable check,
+    not a blanket ban on custom agents under a spec adapter. Whoever can write
+    an agent spec can also simply list ``execute_bash`` in it, so a spec that
+    does not parse as a kiro mode at all is a gap in evidence, not a bypass.
 
     Agents Kiro Crew itself authors are exempt because their shell-less profiles
     (e.g. ``kirocrew-lite``, the cheap background agent behind auto-titles /
@@ -1929,22 +2223,16 @@ def _spec_adapter_shell_restriction(agent: str) -> str | None:
         return None
     if f"{agent}.json" in OWNED_KIRO_AGENT_FILES:
         return None
-    try:
-        raw = (kiro_agents_dir() / f"{agent}.json").read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    tools = data.get("tools")
-    if not isinstance(tools, list):
-        return None
-    if "execute_bash" in tools:
-        return None
-    return (
-        f"~/.kiro/agents/{agent}.json omits execute_bash from its tools list "
-        "(a deliberate shell-access restriction)"
-    )
+    # A dispatchable project candidate shadows the user scope entirely, so the
+    # user dir is scanned only when the project offers none.
+    candidates = _spec_adapter_project_agent_candidates(
+        agent, project_dir
+    ) or _spec_adapter_user_agent_candidates(agent)
+    for path, data in candidates:
+        reason = _agent_spec_withholds_shell(path, data)
+        if reason:
+            return reason
+    return None
 
 
 class AcpClient:
@@ -3260,21 +3548,38 @@ class AcpClient:
         out of scope for Kiro Crew's own policy/profile ceiling, which does
         not substitute for it). A spec adapter (claude, codex) never sends
         ``set_mode`` and reads no kiro agent config at all, so an agent whose
-        ``~/.kiro/agents/<agent>.json`` deliberately omits ``execute_bash`` —
-        e.g. the shipped ``auto-improvement-pr-author`` (``"tools": []``), a
-        prose-only agent with no shell access on kiro-cli — would silently
-        run with the adapter's own unrestricted built-in shell tool instead:
-        a privilege escalation of exactly the kind the kiro-side guard
-        (fail-closed on a missing mode, in ``_initialize_session``) exists to
-        prevent.
+        config withholds shell access (a ``tools`` list with no
+        ``execute_bash`` / ``shell`` / ``"*"`` entry) — e.g. the shipped
+        ``auto-improvement-pr-author`` (``"tools": []``), a prose-only agent
+        with no shell access on kiro-cli — would silently run with the
+        adapter's own unrestricted built-in shell tool instead: a privilege
+        escalation of exactly the kind the kiro-side guard (fail-closed on a
+        missing mode, in ``_initialize_session``) exists to prevent.
 
-        Only a POSITIVE finding refuses: the default ``kirocrew`` agent and
-        any agent whose config cannot be read/parsed, has no ``tools`` key,
-        or already lists ``execute_bash``, are unaffected (unchanged
-        behavior) — this stays a narrow, verifiable check, not a blanket ban
-        on custom agents under a spec adapter.
+        The session's ``_work_dir`` is passed as the project scope so the
+        config is resolved exactly as kiro-cli resolves ``--agent`` for this
+        session: it is the cwd the backend is spawned with, and
+        ``<cwd>/.kiro/agents`` shadows the user-level agents dir.
+
+        Only a POSITIVE finding refuses: the default ``kirocrew`` agent, the
+        managed agents Kiro Crew itself authors
+        (``agent_files.OWNED_KIRO_AGENT_FILES``, whose shell-less profiles are
+        Kiro Crew's own scope/cost choice rather than an operator ceiling),
+        and any agent whose config is missing or unparseable, has no ``tools``
+        key, or grants shell, are unaffected — this stays a narrow, verifiable
+        check, not a blanket ban on custom agents under a spec adapter. Exactly
+        two unreadable cases still refuse, the ones Kiro Crew's own reader policy
+        creates while kiro-cli would activate the file regardless: a spec over
+        the read cap (kiro-cli caps nothing) and one whose resolved target is
+        sensitive (kiro-cli filters nothing). Both are unverifiable rather than
+        absent (:func:`_spec_adapter_shell_restriction`).
+
+        Synchronous and filesystem-bound — the project scope reads every spec in
+        ``<work_dir>/.kiro/agents`` — so the handshake awaits it through
+        ``asyncio.to_thread``. Any other caller on an event loop must do the
+        same.
         """
-        restriction = _spec_adapter_shell_restriction(self._agent)
+        restriction = _spec_adapter_shell_restriction(self._agent, self._work_dir)
         if not restriction:
             return
         raise AcpError(
@@ -3446,8 +3751,11 @@ class AcpClient:
             # No set_mode on this dialect, so a custom agent's tools allowlist
             # is never applied natively — refuse the ones we can positively
             # verify need it rather than silently granting the adapter's own
-            # unrestricted shell tool.
-            self._assert_spec_adapter_agent_permitted()
+            # unrestricted shell tool. The guard stats and reads agent specs
+            # (every one in <work_dir>/.kiro/agents), so it runs in a worker
+            # thread: an AcpError still propagates here, while a slow or
+            # blocking read cannot stall the loop mid-handshake.
+            await asyncio.to_thread(self._assert_spec_adapter_agent_permitted)
 
         # 5. Set model — override if KiroCrew config specifies non-default.
         await self._apply_startup_model()

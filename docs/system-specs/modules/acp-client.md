@@ -138,8 +138,8 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
     MCP tab writes directly to the global config.
   - **claude-agent-acp**: does NOT read any config file or `--agent` flag, so
     `session/new` (and `session/load`) must carry the servers in the
-    `mcpServers` param. `_claude_acp_mcp_servers()` reads the KiroCrew-owned
-    `~/.claude/agents/kirocrew.mcp.json` (kept current by
+    `mcpServers` param. `AcpClient._claude_session_mcp_servers()` reads the
+    `~/.claude/agents/kirocrew.mcp.json` owned by Kiro Crew (kept current by
     `agent.install_cc_agent_config`) and reshapes it to the ACP array via
     `cc_agent.acp_servers_from_cc_map` (stdio → `{name,command,args,env:[{name,value}],type}`;
     url → `{name,type:"http"|"sse",url,headers}`). kirocrew-core/cron are forced
@@ -157,24 +157,125 @@ Custom agents use cold start with `--agent <name>` flag at spawn time.
 `set_mode`, no `--agent`-driven config read (see "Backend Selection" above).
 For the default `kirocrew` agent this is already covered: its persona, model,
 and MCP servers are delivered by other mechanisms (`context.py` injection,
-`_apply_startup_model`, `_codex_session_mcp_servers`/`_claude_acp_mcp_servers`),
+`_apply_startup_model`, `_codex_session_mcp_servers`/`_claude_session_mcp_servers`),
 and Kiro Crew's own governance ceiling + denied-command floor apply at the
 hooks gate regardless of backend (governance.md). But a non-default agent
-whose `~/.kiro/agents/<agent>.json` deliberately narrows `tools` — e.g. the
+whose kiro agent config deliberately narrows `tools` — e.g. the
 shipped `auto-improvement-pr-author` (`"tools": []`, a prose-only agent with
 no shell access on kiro-cli) — has no equivalent on a spec adapter: the
 adapter's own built-in tools (shell included) are not gated by that file at
 all, so silently running the agent there would grant it shell access its
 kiro-cli config specifically withholds. `_spec_adapter_shell_restriction()`
 in `acp/client.py` checks the target agent's on-disk config for exactly this
-one verifiable case (`tools` present and missing `execute_bash`);
+one verifiable case: a `tools` list present and carrying **none** of
+`execute_bash`, `shell`, or `"*"` — kiro-cli grants the same builtin shell
+tool under either name and expands `"*"` to every tool, so a list with any of
+the three is a shell GRANT, not a restriction (a name-only match on
+`execute_bash` refuses `["shell"]` and `["*"]` agents for a reason that is not
+true of them). All three names are kiro-cli's own tools semantics, not anything
+this repo implements — the spec is handed to the backend verbatim and no
+in-tree code expands a `tools` list. `"*"` is the backend's canonical "every
+tool": the spec template `kiro-cli agent create` writes carries
+`"tools": ["*"]`. `execute_bash` and `shell` are two names for the same shell
+builtin across kiro-cli versions, which is why `agent._strip_legacy_denied_commands`
+has to iterate **both** keys of a spec's `toolsSettings` to find the shell entry;
+independently of parser vintage, an author who lists `shell` intends to grant
+shell. The set is therefore the guard's model of the backend, and it errs
+permissive: widening it beyond the names kiro-cli honors permits sessions that
+are in fact restricted.
+
+The config is resolved the way kiro-cli resolves `--agent` for that session:
+the session work dir's `<project>/.kiro/agents`
+(`_spec_adapter_project_agent_candidates`) **shadows** the user-level agents dir
+(`_spec_adapter_user_agent_candidates`), which is consulted only when the
+project declares no dispatchable spec for the name. Both scopes are required:
+the work dir is the cwd the backend is spawned with, so a project-local spec
+shadows a same-named user-level one (`config.paths.project_agents_dir`), and
+reading only the user-level dir lets a project-local shell-withholding agent
+run with the adapter's shell unnoticed.
+
+**In both scopes the match is on the name the spec is dispatchable under — a
+declared `name` field wins over the filename stem — never on the filename
+alone.** That is the same computation `agent_discovery` makes for both dispatch
+sets (`_project_agent_info`, and `_global_agent_info` naming every user-level
+row `spec_str(data, "name", f.stem)`), and in the user scope it is load-bearing
+rather than cosmetic: filenames there are namespaced by whoever materialized
+them — an app writes `<app>--<agent>.json` (`apps.bridges._safe_link_name`) and
+a package installs `<Pkg>-<name>.json` — so a `<agent>.json`-only lookup reads
+every app- and package-installed restricted profile as absent and grants it the
+adapter's shell. The user scope checks `<agent>.json` first (the fast path for an
+unnamespaced spec, and the only path for a name carrying glob metacharacters),
+then narrows a scan to filenames **ending** in the agent name and confirms each
+against the authoritative `name` field — the same bounded narrowing
+`mcp_gateway.session_servers._load_overlay_for_agent` and
+`dashboard.handlers.agents._namespaced_agent_file_exists` use, which keeps the
+check off a read of every spec in the **user** dir — the one every app and
+package that materializes an agent writes into, so it holds far more specs than
+a project dir. The project scope narrows nothing and deliberately reads **every**
+spec in `<work_dir>/.kiro/agents`: dispatch is on the declared `name`, so only a
+full scan is a complete match there.
+What the narrowing gives up is a spec whose filename does not end in the `name`
+it declares — a shape no materializer in-tree produces, since every one of them
+suffixes the declared name, and one whose author could equally have listed
+`execute_bash`.
+
+In both scopes **every** matching candidate is inspected and any one of them
+withholding shell refuses: two files can declare the same `name` with no stable
+winner to mirror — `agent_discovery.list_agents` overwrites `seen[name]` while
+walking the stem-sorted project files (so its project winner is whichever file
+sorts last, an artifact of the sort rather than a documented rule) and picks
+between user-level twins on package preference and first-seen order. Refusing on
+any candidate is the fail-closed reading of that tie; picking one would let a
+permissive twin mask a restrictive spec that `--agent` may equally resolve to.
+
+Both scopes read through `agent_discovery._read_agent_spec`, the hardened
+reader behind those dispatch sets — `project_dir` arrives from a
+caller-supplied session field, which is why the per-file hardening matters. The
+scan is blocking filesystem work (bounded per file by that reader's cap,
+unbounded in file *count* for the project scope's full scan), so the handshake
+awaits the whole guard through `asyncio.to_thread`: **no spec read happens on the
+event loop**, and an `AcpError` still propagates to the handshake. One hazard is
+inherited rather than fixed — a FIFO planted at a candidate path blocks the
+reader's `open` until a writer appears, which off-loop stalls that one handshake
+instead of the whole loop; it is a pre-existing property of
+`hooks.safe_read_file_bytes` shared with its every caller.
+**That reader's refusals are honored the way kiro-cli would see them**, which
+splits them two ways:
+
+- Refusals kiro-cli **shares** — unparseable or non-object JSON, an AppleDouble
+  sidecar, a broken or looping symlink, a file the OS will not hand over — mean
+  the file cannot become a kiro mode there either, so there is no restriction to
+  honor and the candidate is **skipped**. `agent_discovery` drops it from the
+  dispatch set too, so it shadows nothing: an unparseable
+  `<project>/.kiro/agents/<agent>.json` must not suppress the guard's read of the
+  user-level spec that `--agent` does resolve to.
+- Refusals that are Kiro Crew's **own reader policy while kiro-cli would still
+  activate the file** refuse as unverifiable rather than reading as absent,
+  in either scope. There are exactly two: a spec over the read cap
+  (`hooks.MAX_FILE_BYTES`; kiro-cli caps nothing — `_agent_spec_over_read_cap`)
+  and one whose resolved target is under a sensitive tree (kiro-cli applies no
+  such filter — `_agent_spec_sensitive_target`). Both checks are stat-only /
+  resolve-only, so asking the question performs neither the unbounded read the
+  cap prevents nor any read of the protected target. Such a candidate is refused
+  **whatever its filename**: the name a spec is dispatchable under is its
+  declared `name`, which lives in the body the refusal forbids reading, so its
+  stem is no evidence — a namespaced `<app>--<agent>.json` declares a name its
+  stem does not repeat. The cost is a false refusal on a file that only *looks*
+  unrelated while being simultaneously over the cap or sensitive-targeted, and
+  that is the fail-closed side of the trade: dropping it would grant the
+  adapter's unrestricted shell for a spec whose withheld shell kiro-cli honors.
+  Files that never enter a scope's candidate set at all are unaffected — the
+  user scope only ever inspects `<agent>.json` and the `*<agent>.json` matches.
+
 `AcpClient._assert_spec_adapter_agent_permitted()` raises `AcpError` from it
 at the same handshake step kiro's `set_mode` guard occupies (`_initialize_session`,
 step 4), rather than silently degrading. It fires only on a positive finding — a
 missing/unparseable agent config, one with no `tools` key, or one that
-already lists `execute_bash`, is unaffected (matches today's behavior),
-which keeps this a narrow polyfill rather than a blanket ban on custom
-agents under `claude`/`codex`. Managed agents Kiro Crew itself authors
+grants shell, is unaffected, which keeps this a narrow polyfill rather than a
+blanket ban on custom agents under `claude`/`codex` (whoever can write a spec
+can also list `execute_bash` in it, so a file that is not a dispatchable kiro
+mode at all is a gap in evidence, not a bypass). Managed agents Kiro Crew itself
+authors
 (`agent_files.OWNED_KIRO_AGENT_FILES`: `kirocrew-lite`, `kirocrew-knowledge`,
 `kirocrew-research`, `kirocrew-heartbeat`) are exempt: their shell-less
 profiles are Kiro Crew's own scope/cost choice over prompts it authors itself,
