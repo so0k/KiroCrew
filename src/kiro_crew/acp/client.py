@@ -47,6 +47,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_CLIENT_CAPABILITIES,
+    ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -3781,12 +3782,23 @@ class AcpClient:
         protocol_version: int | str = (
             PROTOCOL_VERSION_CLAUDE if self._is_spec_adapter else PROTOCOL_VERSION
         )
+        # Spec adapters get the elicitation-free capability set: codex-acp
+        # routes MCP tool-call approvals through `elicitation/create` whenever
+        # the form capability is declared, and Kiro Crew has no handler for it —
+        # the rejected request cancels the tool call. Omitting the capability
+        # makes codex-acp fall back to `session/request_permission`, which the
+        # normal approval pipeline serves.
+        client_capabilities = (
+            ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER
+            if self._is_spec_adapter
+            else ACP_CLIENT_CAPABILITIES
+        )
         init_id = await self._send_request(
             METHOD_INITIALIZE,
             {
                 "protocolVersion": protocol_version,
                 "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
-                "clientCapabilities": ACP_CLIENT_CAPABILITIES,
+                "clientCapabilities": client_capabilities,
             },
         )
         init_resp = await self._wait_for_response(init_id, timeout=_INIT_TIMEOUT)

@@ -7,12 +7,38 @@ agent assumed the all-false default.
 
 from pathlib import Path
 
-from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES
+from kiro_crew.acp.types import (
+    ACP_CLIENT_CAPABILITIES,
+    ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
+)
 
 
 def test_elicitation_is_declared() -> None:
     """kiro-cli gates `elicitation/create` on this capability being present."""
     assert ACP_CLIENT_CAPABILITIES["elicitation"] == {"form": {}, "url": {}}
+
+
+def test_spec_adapter_does_not_declare_elicitation() -> None:
+    """The spec-adapter set must NOT advertise elicitation.
+
+    codex-acp gates MCP tool-call approvals on
+    ``clientCapabilities.elicitation.form``: declared → every approval arrives
+    as an ``elicitation/create`` request, which Kiro Crew rejects as unknown and
+    codex-acp converts into ``action: "cancel"`` — silently cancelling every
+    MCP tool call in the session. Absent → codex-acp falls back to
+    ``session/request_permission``, which the normal approval pipeline serves.
+    """
+    assert "elicitation" not in ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER
+
+
+def test_spec_adapter_set_tracks_the_base_set_otherwise() -> None:
+    """Apart from elicitation the two sets must not drift.
+
+    The spec-adapter dict is derived from the base dict, so a capability added
+    to the base automatically reaches spec adapters — this pins that contract.
+    """
+    expected = {k: v for k, v in ACP_CLIENT_CAPABILITIES.items() if k != "elicitation"}
+    assert ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER == expected
 
 
 def test_fs_and_terminal_stay_false() -> None:

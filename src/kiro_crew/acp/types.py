@@ -73,15 +73,15 @@ TODO_TASKS_MAX = 200
 # Per-task text cap — keeps one pathological entry from bloating every payload.
 TODO_TEXT_MAX = 500
 
-# Capabilities we advertise during `initialize`.
+# Capabilities we advertise during `initialize` (kiro-cli dialect).
 #
 # `elicitation` is a deliberate forward-bet: kiro-cli 2.14.0 compiles the
 # `elicitation/create` schema (form + url modes) and gates it on this
 # capability, but does NOT yet route an MCP server's `elicitation/create` out
 # over ACP — a stub MCP server issuing one gets back
-# `-32601 method not found`. Declaring support costs nothing today and means
-# the agent can start using the richer prompt the moment kiro-cli ships the
-# bridge.
+# `-32601 method not found`. Declaring support costs nothing on THIS dialect
+# today and means the agent can start using the richer prompt the moment
+# kiro-cli ships the bridge.
 #
 # `fs` and `terminal` stay false: KiroCrew does not serve the agent's file or
 # terminal requests over ACP — the agent uses its own tools for that, and
@@ -90,6 +90,20 @@ ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
     "elicitation": {"form": {}, "url": {}},
+}
+
+# Spec-adapter variant: identical, MINUS `elicitation`. On the spec dialect the
+# forward-bet is actively harmful: codex-acp gates MCP tool-call approvals on
+# `clientCapabilities.elicitation.form` and, when it is declared, sends every
+# approval as an `elicitation/create` client request. Kiro Crew has no handler
+# for that method, `_reject_unknown_server_request` errors it, and codex-acp
+# converts the error into `action: "cancel"` — silently cancelling EVERY MCP
+# tool call in the session. With the capability absent, codex-acp falls back to
+# `session/request_permission`, which Kiro Crew fully implements (approval flow,
+# governance gate, dashboard UI). Do not re-add `elicitation` here without
+# shipping an `elicitation/create` handler first.
+ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER: dict = {
+    key: value for key, value in ACP_CLIENT_CAPABILITIES.items() if key != "elicitation"
 }
 
 # ── ACP Backend Identifiers ──
