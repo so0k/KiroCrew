@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional
 
 from kiro_crew.llm_helpers import ToolApprovalPolicy, provider_last_turn_usage, stream_and_collect
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.session_map import configured_provider_label
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,10 @@ def build_agent_fn(
                         key,
                         opts.get("model") or default_model or "",
                         provider_last_turn_usage(provider),
-                        provider="acp",
+                        # The backend actually serving the turn: agent.provider is
+                        # pinned to "acp" on this fork, so only the shared helper
+                        # distinguishes a codex-backed turn in usage telemetry.
+                        provider=configured_provider_label(),
                         surface="workflow",
                         agent=(read_effective_agent(provider)
                                or opts.get("agent") or default_agent or ""),

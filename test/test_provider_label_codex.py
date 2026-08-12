@@ -17,6 +17,10 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
+import kiro_crew.dashboard.handlers.usage as usage_mod
+import kiro_crew.workflows.agent_exec as agent_exec_mod
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session_map import configured_provider_label
 
@@ -69,6 +73,9 @@ class TestChangedCallSitesWireTheSharedHelper:
 
         assert chat_runner_mod.configured_provider_label is configured_provider_label
 
+    def test_workflow_agent_exec_module_shares_the_helper(self):
+        assert agent_exec_mod.configured_provider_label is configured_provider_label
+
     def test_subagent_label_choice_yields_codex_under_codex_config(self):
         # Reproduces subagent.py's state/usage-row label expression —
         # ``"claude_code" if is_cc else configured_provider_label()`` — using
@@ -110,3 +117,76 @@ class TestChangedCallSitesWireTheSharedHelper:
                 gateway_mod.configured_provider_label() if hasattr(fake_self, "_cfg") else "acp"
             )
         assert provider == "codex"
+
+
+class _FakeProvider:
+    """Bare provider double: no context/agent accessors, so the real
+    ``read_context_tokens`` yields ``(0, 0)`` and ``read_effective_agent`` ``""``.
+    """
+
+    def __init__(self, key: str = "k") -> None:
+        self.key = key
+
+
+class _FakeSessions:
+    """Minimal ``SessionManager`` double for ``build_agent_fn``."""
+
+    async def get_or_create(self, key, *, agent=None, model=None, cwd=None, **kw):
+        return _FakeProvider(key), True, False
+
+    def release(self, key, *, cleanup=False):
+        pass
+
+
+class TestWorkflowUsageRowProviderLabel:
+    """The workflow-agent usage row carries the configured backend's label.
+
+    ``build_agent_fn``'s per-turn row is the workflow surface's only spend
+    attribution, so a hardcoded "acp" there files every codex-backed workflow
+    turn under the wrong provider dimension. These tests drive the real
+    ``agent_fn`` and capture the record ``_build_token_record`` actually
+    produced (``_write_token_record`` patched out, so no disk I/O).
+    """
+
+    @staticmethod
+    def _rows(monkeypatch) -> list[dict]:
+        rows: list[dict] = []
+        monkeypatch.setattr(
+            usage_mod, "_write_token_record", lambda record, now: rows.append(record)
+        )
+
+        async def fake_stream(provider, message, **kw):
+            return f"reply:{message}"
+
+        monkeypatch.setattr(agent_exec_mod, "stream_and_collect", fake_stream)
+        return rows
+
+    @pytest.mark.asyncio
+    async def test_row_provider_is_codex_under_codex_backend(self, monkeypatch):
+        rows = self._rows(monkeypatch)
+        fn = agent_exec_mod.build_agent_fn(
+            _FakeSessions(), run_id="wf_codex", default_agent="researcher", default_model="m1"
+        )
+
+        with patch.object(KiroCrewConfig, "load", return_value=_cfg("codex")):
+            out = await fn("do work", {})
+
+        assert out == "reply:do work"
+        assert len(rows) == 1
+        assert rows[0]["surface"] == "workflow"
+        assert rows[0]["provider"] == "codex"
+
+    @pytest.mark.asyncio
+    async def test_row_provider_is_acp_without_codex_backend(self, monkeypatch):
+        # Negative control: the label is resolved from config, not pinned to
+        # either literal.
+        rows = self._rows(monkeypatch)
+        fn = agent_exec_mod.build_agent_fn(
+            _FakeSessions(), run_id="wf_acp", default_agent="researcher", default_model="m1"
+        )
+
+        with patch.object(KiroCrewConfig, "load", return_value=_cfg("")):
+            await fn("do work", {})
+
+        assert len(rows) == 1
+        assert rows[0]["provider"] == "acp"
