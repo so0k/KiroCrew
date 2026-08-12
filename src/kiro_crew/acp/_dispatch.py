@@ -639,7 +639,11 @@ def _build_tool_call_event(
         raw_params_cache[tool_call_id] = raw_input
     # Capture the shell signal from the RAW kind (before redaction) so a later
     # permission_request (which carries no kind) can inherit it via shell_cache.
-    is_shell = is_shell_kind(kind)
+    # A spec-adapter MCP dispatch (codex-acp stamps them kind="execute") is NOT
+    # a shell command — reclassify so the gate governs mcp__<server>__<tool>
+    # instead of denying an unverifiable shell command.
+    _spec_server, _spec_tool = spec_adapter_mcp_identity(update)
+    is_shell = False if _spec_server else is_shell_kind(kind)
     if tool_call_id and shell_cache is not None:
         shell_cache[tool_call_id] = is_shell
     # Capture the TRUSTED MCP server identity (_meta.kiro.mcpServerName) so the
@@ -648,13 +652,15 @@ def _build_tool_call_event(
     # app-own-server auto-approve (hooks.on_tool_call) fire on the permission
     # path: without the cache, the permission event's mcp_server_name is always
     # "" and the branch never matches.
-    _mcp_server_name = _kiro_mcp_server_name(update)
+    # Spec adapters carry the equivalent identity in rawInput {server, tool}
+    # (guarded by _meta.is_mcp_tool_call) — same trust level, same lifecycle.
+    _mcp_server_name = _kiro_mcp_server_name(update) or _spec_server
     if tool_call_id and mcp_server_name_cache is not None:
         mcp_server_name_cache[tool_call_id] = _mcp_server_name
     # Same lifecycle for the trusted tool name (_meta.kiro.toolName) so the
     # permission event can reconstruct the canonical mcp__<server>__<tool> for
     # per-tool governance in the app-own-server auto-approve.
-    _tool_name = _kiro_tool_name(update)
+    _tool_name = _kiro_tool_name(update) or _spec_tool
     if tool_call_id and tool_name_cache is not None:
         tool_name_cache[tool_call_id] = _tool_name
     # Initial tool input string from raw params.
@@ -844,6 +850,41 @@ def _kiro_mcp_server_name(update: dict[str, Any]) -> str:
     return name if isinstance(name, str) else ""
 
 
+def spec_adapter_mcp_identity(update: dict[str, Any]) -> tuple[str, str]:
+    """``(server, tool)`` for a spec-adapter MCP dispatch, else ``("", "")``.
+
+    codex-acp marks the tool_call updates for its MCP dispatches with the
+    adapter-authored ``_meta.is_mcp_tool_call: true`` and carries the real
+    dispatch target in ``rawInput`` ``{server, tool, arguments}`` — the pair the
+    adapter genuinely dispatches to, making it the spec-dialect equivalent of
+    kiro-cli's trusted ``_meta.kiro.mcpServerName`` / ``toolName`` identity
+    (``_meta`` is runtime envelope, never LLM-authored text).
+
+    Why this matters for security classification: codex-acp stamps these tool
+    calls ``kind: "execute"``, the shell kind. Without this identity the shell
+    deny-by-default then blocks every spec-adapter MCP call — the permission
+    gate sees ``is_shell=True`` with no recoverable ``command`` (the rawInput is
+    the MCP triple, not a command line) and refuses. A non-empty server here is
+    the signal to classify the call as MCP, not shell, so it is governed as
+    ``mcp__<server>__<tool>`` through the normal approval pipeline instead.
+
+    A missing/false ``_meta.is_mcp_tool_call`` fails closed to ``("", "")`` —
+    the call keeps its shell classification (over-blocking is the safe
+    direction).
+    """
+    meta = update.get("_meta")
+    if not isinstance(meta, dict) or meta.get("is_mcp_tool_call") is not True:
+        return "", ""
+    raw = update.get("rawInput")
+    if not isinstance(raw, dict):
+        return "", ""
+    server = raw.get("server")
+    tool = raw.get("tool")
+    if not isinstance(server, str) or not server:
+        return "", ""
+    return server, tool if isinstance(tool, str) else ""
+
+
 def _todo_payload(raw_output: Any) -> dict[str, Any] | None:
     """Dig the todo dict out of ``rawOutput``, tolerating shape drift.
 
@@ -971,13 +1012,20 @@ def _build_tool_refinement_event(
     kind_str = _redact(kind) if isinstance(kind, str) and kind else ""
     # Refresh the cached shell signal only when this refinement carries a kind
     # (kind is optional on updates); a kind-less refinement must not clobber a
-    # True cached by the initial tool_call. Mirrors AcpClient exactly.
+    # True cached by the initial tool_call. Mirrors AcpClient exactly. A
+    # refinement that identifies as a spec-adapter MCP dispatch stays
+    # non-shell even though codex-acp stamps it kind="execute".
+    _refine_spec_server, _ = spec_adapter_mcp_identity(update)
     if shell_cache is not None:
         if isinstance(kind, str) and kind:
-            shell_cache[tool_use_id] = is_shell_kind(kind)
+            shell_cache[tool_use_id] = False if _refine_spec_server else is_shell_kind(kind)
         is_shell = shell_cache.get(tool_use_id, False)
     else:
-        is_shell = is_shell_kind(kind) if isinstance(kind, str) and kind else False
+        is_shell = (
+            is_shell_kind(kind)
+            if isinstance(kind, str) and kind and not _refine_spec_server
+            else False
+        )
     return AcpEvent(
         kind=EVENT_TOOL_CALL_UPDATE,
         title=title_str,
@@ -1115,6 +1163,7 @@ __all__ = [
     "make_unified_diff",
     "select_tool_title",
     "is_shell_kind",
+    "spec_adapter_mcp_identity",
     "redact_text",
     "METHOD_SET_MODE",
     "METHOD_SET_MODEL",

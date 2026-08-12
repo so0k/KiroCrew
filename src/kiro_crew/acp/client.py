@@ -40,6 +40,7 @@ from kiro_crew.acp._dispatch import (
     extract_tool_purpose,
     parse_session_modes,
     parse_usage_update,
+    spec_adapter_mcp_identity,
 )
 from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOracle
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
@@ -5845,16 +5846,25 @@ class AcpClient:
             # the user actually sees. Same helper is used in both places.
             # Capture the canonical shell signal from the raw kind BEFORE
             # redaction so the later permission_request event (which carries no
-            # kind) can inherit it via the toolCallId cache below.
-            is_shell = _is_shell_kind(kind)
+            # kind) can inherit it via the toolCallId cache below. A
+            # spec-adapter MCP dispatch (codex-acp stamps them kind="execute")
+            # is NOT a shell command — reclassify so the gate governs
+            # mcp__<server>__<tool> instead of denying an unverifiable shell
+            # command (rawInput carries the MCP triple, never a command line).
+            _spec_server, _spec_tool = spec_adapter_mcp_identity(update)
+            is_shell = False if _spec_server else _is_shell_kind(kind)
             if tool_call_id:
                 self._tool_call_is_shell[tool_call_id] = is_shell
                 # Same lifecycle as is_shell: cache the trusted MCP server
-                # identity so the later permission event can inherit it.
-                self._tool_call_mcp_server[tool_call_id] = _kiro_mcp_server_name(update)
+                # identity so the later permission event can inherit it. Spec
+                # adapters carry it in rawInput {server, tool} (guarded by
+                # _meta.is_mcp_tool_call) instead of _meta.kiro.
+                self._tool_call_mcp_server[tool_call_id] = (
+                    _kiro_mcp_server_name(update) or _spec_server
+                )
                 # Cache the trusted tool name too, so the permission event can
                 # rebuild mcp__<server>__<tool> for per-tool governance.
-                self._tool_call_tool_name[tool_call_id] = _kiro_tool_name(update)
+                self._tool_call_tool_name[tool_call_id] = _kiro_tool_name(update) or _spec_tool
             title = _select_tool_title(title, raw_input) or ""
             if title:
                 title, _ = redact_exfiltration_urls(title)
@@ -6024,9 +6034,14 @@ class AcpClient:
         # Refresh the cached shell signal only when this refinement carries a
         # kind. A refinement that omits kind must NOT clobber a True cached by
         # the initial tool_call notification (kind is optional on updates).
-        # Cache off the RAW kind, not the redacted kind_str.
+        # Cache off the RAW kind, not the redacted kind_str. A refinement that
+        # identifies as a spec-adapter MCP dispatch stays non-shell even though
+        # codex-acp stamps it kind="execute".
         if isinstance(kind, str) and kind:
-            self._tool_call_is_shell[tool_use_id] = _is_shell_kind(kind)
+            _refine_spec_server, _ = spec_adapter_mcp_identity(update)
+            self._tool_call_is_shell[tool_use_id] = (
+                False if _refine_spec_server else _is_shell_kind(kind)
+            )
         is_shell = self._tool_call_is_shell.get(tool_use_id, False)
         return AcpEvent(
             kind=EVENT_TOOL_CALL_UPDATE,

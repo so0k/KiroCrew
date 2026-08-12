@@ -115,6 +115,87 @@ class TestBuildToolCallEventIdentity:
         assert event.is_shell is True
 
 
+class TestSpecAdapterMcpIdentity:
+    """Spec-adapter (codex-acp) MCP dispatches are classified as MCP, not shell.
+
+    codex-acp stamps its MCP tool calls ``kind: "execute"`` with the
+    adapter-authored ``_meta.is_mcp_tool_call: true`` and the real dispatch
+    target in ``rawInput {server, tool, arguments}``. Without the
+    reclassification the shell deny-by-default blocks every spec-adapter MCP
+    call: the permission gate sees ``is_shell=True`` with no recoverable
+    command (the rawInput is the MCP triple) and refuses.
+    """
+
+    @staticmethod
+    def _codex_mcp_update() -> dict[str, Any]:
+        return {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "exec-41ccd89a",
+            "kind": "execute",
+            "title": "mcp.kirocrew-core.artifact_save",
+            "status": "in_progress",
+            "rawInput": {
+                "server": "kirocrew-core",
+                "tool": "artifact_save",
+                "arguments": {"name": "x", "content": "<p>hi</p>"},
+            },
+            "_meta": {"is_mcp_tool_call": True},
+        }
+
+    def test_reclassified_as_mcp_not_shell(self) -> None:
+        event = _build_tool_call_event(self._codex_mcp_update(), None)
+        assert event.is_shell is False
+        assert event.mcp_server_name == "kirocrew-core"
+        assert event.tool_name == "artifact_save"
+
+    def test_shell_cache_records_non_shell(self) -> None:
+        """The later permission_request inherits its shell signal from this
+        cache — a True here is what produced the deny-by-default block."""
+        shell_cache: dict[str, bool] = {}
+        _build_tool_call_event(self._codex_mcp_update(), None, shell_cache=shell_cache)
+        assert shell_cache == {"exec-41ccd89a": False}
+
+    def test_identity_caches_populated(self) -> None:
+        servers: dict[str, str] = {}
+        tools: dict[str, str] = {}
+        _build_tool_call_event(
+            self._codex_mcp_update(),
+            None,
+            mcp_server_name_cache=servers,
+            tool_name_cache=tools,
+        )
+        assert servers == {"exec-41ccd89a": "kirocrew-core"}
+        assert tools == {"exec-41ccd89a": "artifact_save"}
+
+    def test_missing_meta_flag_stays_shell(self) -> None:
+        """A server/tool-shaped rawInput WITHOUT the adapter-authored _meta flag
+        keeps the shell classification (fail-closed: rawInput alone is
+        model-authored and must not waive the shell deny-by-default)."""
+        upd = self._codex_mcp_update()
+        upd["_meta"] = {}
+        event = _build_tool_call_event(upd, None)
+        assert event.is_shell is True
+        assert event.mcp_server_name == ""
+
+    def test_kiro_meta_wins_over_spec_identity(self) -> None:
+        """When both channels are present, the kiro dialect identity wins."""
+        upd = self._codex_mcp_update()
+        upd["_meta"] = {
+            "is_mcp_tool_call": True,
+            "kiro": {"toolName": "other_tool", "mcpServerName": "other-server"},
+        }
+        event = _build_tool_call_event(upd, None)
+        assert event.mcp_server_name == "other-server"
+        assert event.tool_name == "other_tool"
+
+    def test_non_string_server_fails_closed(self) -> None:
+        upd = self._codex_mcp_update()
+        upd["rawInput"]["server"] = {"nested": "dict"}
+        event = _build_tool_call_event(upd, None)
+        assert event.is_shell is True
+        assert event.mcp_server_name == ""
+
+
 # ── Part 3: chat_runner directive gate (security regression, integration) ─────
 #
 # These drive the real ``dashboard.chat_runner._run_chat`` turn loop with a fake
