@@ -163,6 +163,29 @@ def test_a_broker_stub_for_the_cron_gets_no_pickup(bound):
     assert not bound._pickups
 
 
+def test_an_enforced_harness_gets_a_pickup_on_the_panel_server_too(bound):
+    """Its tools call /api/agent-panel/* through mcp_core's request helper."""
+    panel = {"name": "kirocrew-panel", "command": sys.executable, "args": ["mcp-panel"], "env": []}
+    (out,) = _issue([panel])
+    env = _env(out)
+    assert len(env[PICKUP_ENV]) == 64
+    assert env[GATEWAY_PID_ENV] == str(os.getpid())
+    (entry,) = bound._pickups.values()
+    assert entry.session_token == "tok" and entry.server == "kirocrew-panel"
+
+
+def test_a_broker_stub_for_the_panel_gets_no_pickup(bound):
+    stub = {
+        "name": "kirocrew-panel",
+        "command": sys.executable,
+        "args": ["-m", STUB_MODULE, "--server", "kirocrew-panel"],
+        "env": [],
+    }
+    (out,) = _issue([stub])
+    assert PICKUP_ENV not in _env(out) and GATEWAY_PID_ENV not in _env(out)
+    assert not bound._pickups
+
+
 @pytest.mark.parametrize("backend", ["kiro", "kas", "claude"])
 def test_a_harness_that_reads_the_secret_keeps_its_array_unchanged(bound, backend):
     array = _array()
@@ -252,7 +275,6 @@ def test_redemption_is_a_no_op_without_a_pickup_and_idempotent(monkeypatch):
 _PICKUP_EXEMPT: dict[str, tuple[str, str]] = {
     "kirocrew-computer": ("own transport: loopback_urlopen with X-Internal-Secret", "exempt"),
     "kirocrew-secrets": ("own transport: read_local_secret", "exempt"),
-    "kirocrew-panel": ("tracked: follow-up branch", "#38668"),
     "kirocrew-mate": ("tracked: follow-up branch", "follow-up"),
     "kirocrew-guide": ("tracked: follow-up branch", "follow-up"),
     "kirocrew-work": ("tracked: follow-up branch", "follow-up"),

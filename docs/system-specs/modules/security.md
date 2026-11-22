@@ -4539,7 +4539,7 @@ session's session-control and panel entries are appended
 backends) after its own member appends. A member entry replaces a same-name projected
 element, so issuing before the appends would leave the element the harness starts
 without one. It puts a fresh pickup on the
-`kirocrew-core`, `kirocrew-dashboard` and `kirocrew-cron` elements (`PICKUP_SERVERS`;
+`kirocrew-core`, `kirocrew-dashboard`, `kirocrew-cron` and `kirocrew-panel` elements (`PICKUP_SERVERS`;
 `test_every_managed_server_has_a_pickup_or_a_named_exemption` makes each managed server
 be in it or in a named exemption) only when the session's backend is enforced
 (`tool_gate.is_enforced`, the same predicate that applies the credential mask), the

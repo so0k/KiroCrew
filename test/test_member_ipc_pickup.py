@@ -81,9 +81,6 @@ async def test_each_sent_crew_server_gets_one_pickup(monkeypatch, tmp_path, path
         method = METHOD_SESSION_LOAD
     params = next(params for name, params in sent if name == method)
     sent_servers = {e["name"]: e for e in params["mcpServers"]}
-    if member == "panel-on":
-        # Not a pickup server: the panel entry is appended and sent as it was built.
-        assert PICKUP_ENV not in _env(sent_servers["kirocrew-panel"])
     if backend != "codex":
         # A harness that reads the secret keeps its whole array as it was.
         assert not any(PICKUP_ENV in _env(e) for e in params["mcpServers"])
@@ -92,7 +89,11 @@ async def test_each_sent_crew_server_gets_one_pickup(monkeypatch, tmp_path, path
     if member != "none":
         # The element sent is the member entry, which carries its own identity.
         assert _env(sent_servers["kirocrew-dashboard"]).get("KIROCREW_SESSION_KEY")
-    for name in ("kirocrew-core", "kirocrew-dashboard"):
+    names = ["kirocrew-core", "kirocrew-dashboard"]
+    if member == "panel-on":
+        # The panel entry is appended before issuing, so it is sent with a pickup too.
+        names.append("kirocrew-panel")
+    for name in names:
         env = _env(sent_servers[name])
         assert len(env[PICKUP_ENV]) == 64, name
         assert env[GATEWAY_PID_ENV] == str(os.getpid())
@@ -101,4 +102,4 @@ async def test_each_sent_crew_server_gets_one_pickup(monkeypatch, tmp_path, path
         assert pickup.runtime_pid() == rt._pid
     # One pickup per sent server: none was minted for an element the member entry
     # replaced, where nothing could ever redeem it.
-    assert len(store._pickups) == 2
+    assert len(store._pickups) == len(names)
