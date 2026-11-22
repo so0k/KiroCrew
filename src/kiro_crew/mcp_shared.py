@@ -199,6 +199,12 @@ def run_mcp_stdio_loop(
     # test suite) cannot leak one server's identity into later requests.
     _prior_caller = internal_caller()
     set_internal_caller(server_name)
+    # An enforced harness hands the server a one-time pickup in place of the secret it
+    # withholds; spend it before the first request (a no-op without one, and after a
+    # server's early answer already took it).
+    from kiro_crew.agent_ipc_client import redeem_at_startup
+
+    redeem_at_startup()
     snapshot_stdout_fd()
     prior_handlers = _install_hard_exit_handlers()
     pruned = False

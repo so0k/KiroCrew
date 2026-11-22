@@ -643,10 +643,6 @@ def run_mcp_core_server() -> None:
     from kiro_crew.mcp_tools.sessions import gateway_cjk_words
 
     register_cjk_segmenter(gateway_cjk_words)
-    # Before the first request (a no-op when the server already answered its first
-    # two before importing this module): see ``mcp_core_tool_list._redeem_pickup``.
-    if SERVER.before_first_request is not None:
-        SERVER.before_first_request()
     run_mcp_stdio_loop(
         SERVER.name,
         SERVER.version,

@@ -196,18 +196,80 @@ def test_the_runtime_session_path_issues_the_pickup():
     assert "with_ipc_pickups(" in source and "session_token=stub_token" in source
 
 
-def test_the_dashboard_server_redeems_its_pickup_before_it_serves(monkeypatch):
-    """An issued pickup nobody redeems leaves every dashboard tool refused."""
-    from kiro_crew import mcp_dashboard
+def test_the_stdio_loop_redeems_its_pickup_before_it_serves(monkeypatch):
+    """An issued pickup nobody redeems leaves every tool refused: the shared stdio
+    bootstrap redeems it once, before the first request, for every server."""
+    from kiro_crew import mcp_shared
 
-    assert "kirocrew-dashboard" in ipc_pickup.PICKUP_SERVERS
     calls: list[str] = []
-    monkeypatch.setattr(agent_ipc_client, "redeem_at_startup", lambda _port: calls.append("redeem"))
+    monkeypatch.setattr(agent_ipc_client, "redeem_at_startup", lambda: calls.append("redeem"))
     monkeypatch.setattr(
-        mcp_dashboard, "run_mcp_stdio_loop", lambda *_a, **_k: calls.append("serve")
+        mcp_shared, "_run_stdio_dispatch_loop", lambda *_a, **_k: calls.append("serve") or False
     )
-    mcp_dashboard.run_mcp_server()
+    mcp_shared.run_mcp_stdio_loop("kirocrew-x", "1", lambda: [], lambda _n, _a: "")
     assert calls == ["redeem", "serve"]
+
+
+def test_the_early_answer_path_redeems_before_it_answers(monkeypatch):
+    from kiro_crew import mcp_shared_listing
+
+    mcp_shared_listing._EARLY.served = False
+    calls: list[str] = []
+    monkeypatch.setattr(agent_ipc_client, "redeem_at_startup", lambda: calls.append("redeem"))
+    server = mcp_shared_listing.StdioServer(
+        name="kirocrew-x",
+        version="1",
+        list_tools=lambda: [],
+        before_first_request=lambda: calls.append("hook"),
+    )
+    try:
+        mcp_shared_listing.serve_before_handlers(server, relayed=mcp_shared_listing.RelayedFrames())
+    finally:
+        mcp_shared_listing._EARLY.served = False
+    assert calls == ["redeem", "hook"]
+
+
+def test_redemption_is_a_no_op_without_a_pickup_and_idempotent(monkeypatch):
+    monkeypatch.delenv(PICKUP_ENV, raising=False)
+    monkeypatch.delenv(GATEWAY_PID_ENV, raising=False)
+    monkeypatch.setattr(
+        agent_ipc_client, "current_capability", lambda _p: pytest.fail("no pickup held")
+    )
+    agent_ipc_client.redeem_at_startup()
+    monkeypatch.setenv(PICKUP_ENV, "p")
+    monkeypatch.setenv(GATEWAY_PID_ENV, str(os.getpid() + 1))
+    seen: list = []
+    monkeypatch.setattr(agent_ipc_client, "current_capability", lambda port_fn: seen.append(1))
+    monkeypatch.setattr(agent_ipc_client, "_set_non_dumpable", lambda: None)
+    agent_ipc_client.redeem_at_startup()
+    agent_ipc_client.redeem_at_startup()
+    assert seen == [1]
+
+
+#: Managed servers that get no agent-socket pickup, with why and where it is tracked.
+#: A server is here because it has its own transport, or because its pickup is a
+#: pending follow-up; a new managed server lands in PICKUP_SERVERS or here.
+_PICKUP_EXEMPT: dict[str, tuple[str, str]] = {
+    "kirocrew-computer": ("own transport: loopback_urlopen with X-Internal-Secret", "exempt"),
+    "kirocrew-secrets": ("own transport: read_local_secret", "exempt"),
+    "kirocrew-panel": ("tracked: follow-up branch", "#38668"),
+    "kirocrew-mate": ("tracked: follow-up branch", "follow-up"),
+    "kirocrew-guide": ("tracked: follow-up branch", "follow-up"),
+    "kirocrew-work": ("tracked: follow-up branch", "follow-up"),
+    "kirocrew-crew-log": ("tracked: follow-up branch", "follow-up"),
+    "kirocrew-debug": ("tracked: follow-up branch", "follow-up"),
+}
+
+
+def test_every_managed_server_has_a_pickup_or_a_named_exemption():
+    """A managed server under the credential mask is refused internal_secret_missing
+    unless it holds a pickup; no server may be neither issued one nor named here."""
+    from kiro_crew.agent import _MANAGED_MCP_SERVERS
+
+    undecided = sorted(set(_MANAGED_MCP_SERVERS) - ipc_pickup.PICKUP_SERVERS - set(_PICKUP_EXEMPT))
+    assert not undecided, undecided
+    assert not set(_PICKUP_EXEMPT) & ipc_pickup.PICKUP_SERVERS
+    assert not set(_PICKUP_EXEMPT) - set(_MANAGED_MCP_SERVERS)
 
 
 # --- the server side ---------------------------------------------------------------
@@ -423,41 +485,20 @@ def test_the_session_comes_from_the_gateway_when_the_mapping_is_masked(monkeypat
     assert session_token_sig.session_key_from_env_token() == ""
 
 
-def test_the_cron_server_redeems_a_pickup_at_startup(monkeypatch):
-    """The cron serve entry redeems its pickup before the first request, on the
-    gateway port every gateway-dispatched cron tool reaches through mcp_core."""
-    from kiro_crew import mcp_cron
-    from kiro_crew.mcp_core_parts import gateway as _gateway_part
-
-    called: list = []
-    monkeypatch.setattr(
-        agent_ipc_client, "redeem_at_startup", lambda port_fn: called.append(port_fn)
-    )
-    monkeypatch.setattr(mcp_cron, "run_mcp_stdio_loop", lambda *a, **k: None)
-    monkeypatch.setattr(_gateway_part, "_api_port", lambda: 48123)
-    mcp_cron.run_mcp_server()
-    assert len(called) == 1
-    # The port is resolved lazily, through the helper mcp_core dispatches with.
-    assert called[0]() == 48123
-
-
 def test_every_server_the_allowlist_names_redeems_at_startup():
-    """A pickup that is issued but never redeemed fails every request, so the
-    allowlist may not name a server whose serve entry does not redeem."""
+    """A pickup that is issued but never redeemed fails every request: every
+    allowlisted server runs the shared stdio loop, which redeems at its start."""
     import importlib
     import inspect
 
-    from kiro_crew import mcp_discovery
+    from kiro_crew import mcp_discovery, mcp_shared
 
+    assert "redeem_at_startup()" in inspect.getsource(mcp_shared.run_mcp_stdio_loop)
     for name in sorted(ipc_pickup.PICKUP_SERVERS):
         module = importlib.import_module(mcp_discovery._MANAGED_SERVER_TOOL_MODULES[name])
-        # The redemption is the server's before-first-request hook, which the early
-        # answer path and the serve entry both run.
-        assert module.SERVER.before_first_request is not None, name
         entries = [n for n in ("run_mcp_server", "run_mcp_core_server") if hasattr(module, n)]
         assert len(entries) == 1, (name, entries)
-        source = inspect.getsource(getattr(module, entries[0]))
-        assert "SERVER.before_first_request()" in source, name
+        assert "run_mcp_stdio_loop(" in inspect.getsource(getattr(module, entries[0])), name
 
 
 def test_no_capability_means_no_session_query(monkeypatch):

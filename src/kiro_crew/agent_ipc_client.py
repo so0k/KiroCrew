@@ -170,10 +170,24 @@ def current_capability(port_fn: Callable[[], int]) -> tuple[str, str]:
         return _capability, _socket
 
 
-def redeem_at_startup(port_fn: Callable[[], int]) -> None:
-    """Take the pickup and redeem it, before the server reads its first request."""
+def _default_port() -> int:
+    # Imported only when a pickup exists: the resolver's import graph would
+    # otherwise load before every tools/list (the listing import budget).
+    from kiro_crew.port_resolution import resolve_client_port_src
+
+    return resolve_client_port_src(None)[0]
+
+
+def redeem_at_startup(port_fn: Callable[[], int] | None = None) -> None:
+    """Take the pickup and redeem it, before the server reads its first request.
+
+    Every stdio server's bootstrap calls this once (``mcp_shared.run_mcp_stdio_loop``,
+    and ``mcp_shared_listing.serve_before_handlers`` for a server that lists before its
+    handlers load). A process that holds no pickup does nothing, and a second call finds
+    none left. *port_fn* defaults to the gateway port every internal-route client resolves.
+    """
     if take_pickup():
-        current_capability(port_fn)
+        current_capability(port_fn or _default_port)
 
 
 def capability_request(

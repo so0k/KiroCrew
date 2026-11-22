@@ -265,6 +265,11 @@ def serve_before_handlers(
     _EARLY.served = True
     early = EarlyFrames()
     _EARLY.frames = early
+    # Before any answer that reads the tool policy from the gateway; the loop that
+    # follows finds no pickup left. Imported here, and the call is a no-op without one.
+    from kiro_crew.agent_ipc_client import redeem_at_startup
+
+    redeem_at_startup()
     if server.before_first_request is not None:
         server.before_first_request()
     if relayed is not None:

@@ -42,20 +42,6 @@ def _list_tool_names() -> list[str]:
     return build_tool_names()
 
 
-def _redeem_pickup() -> None:
-    """Redeem an enforced harness's one-time pickup, when this process carries one.
-
-    Such a harness hands the server a pickup in place of the secret it withholds
-    (``kiro_crew.agent_ipc_client``). It has to be redeemed before the first request,
-    because listing the tools already reads this session's tool policy from the
-    gateway. A second call finds no pickup and does nothing.
-    """
-    from kiro_crew.agent_ipc_client import redeem_at_startup
-    from kiro_crew.port_resolution import resolve_client_port_src
-
-    redeem_at_startup(lambda: resolve_client_port_src(None)[0])
-
-
 #: The server as ``initialize`` describes it. ``kiro_crew.mcp_core.run_mcp_core_server``
 #: passes the loop these same values, so the answers written before the handlers load
 #: and the ones the loop writes after cannot differ.
@@ -73,5 +59,4 @@ SERVER = StdioServer(
     list_tools=_list_tools,
     advertise_caller_identity=True,
     reports_inflight=True,
-    before_first_request=_redeem_pickup,
 )
