@@ -32,7 +32,17 @@ logger = logging.getLogger(__name__)
 
 #: The Kiro Crew servers that redeem a pickup at startup (``agent_ipc_client``).
 PICKUP_SERVERS: frozenset[str] = frozenset(
-    {"kirocrew-core", "kirocrew-dashboard", "kirocrew-cron", "kirocrew-panel"}
+    {
+        "kirocrew-core",
+        "kirocrew-dashboard",
+        "kirocrew-cron",
+        "kirocrew-panel",
+        "kirocrew-mate",
+        "kirocrew-guide",
+        "kirocrew-work",
+        "kirocrew-crew-log",
+        "kirocrew-debug",
+    }
 )
 
 

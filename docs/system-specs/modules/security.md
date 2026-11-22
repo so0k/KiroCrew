@@ -4539,9 +4539,11 @@ session's session-control and panel entries are appended
 backends) after its own member appends. A member entry replaces a same-name projected
 element, so issuing before the appends would leave the element the harness starts
 without one. It puts a fresh pickup on the
-`kirocrew-core`, `kirocrew-dashboard`, `kirocrew-cron` and `kirocrew-panel` elements (`PICKUP_SERVERS`;
+`kirocrew-core`, `kirocrew-dashboard`, `kirocrew-cron`, `kirocrew-panel`, `kirocrew-mate`,
+`kirocrew-guide`, `kirocrew-work`, `kirocrew-crew-log` and `kirocrew-debug` elements (`PICKUP_SERVERS`;
 `test_every_managed_server_has_a_pickup_or_a_named_exemption` makes each managed server
-be in it or in a named exemption) only when the session's backend is enforced
+be in it or in a named exemption, now `kirocrew-computer` and `kirocrew-secrets`, which
+have their own transport) only when the session's backend is enforced
 (`tool_gate.is_enforced`, the same predicate that applies the credential mask), the
 session holds a stub token, and this process serves an agent socket; every other
 harness's array is unchanged. A broker-stub element of any of these names gets none

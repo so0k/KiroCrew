@@ -163,22 +163,39 @@ def test_a_broker_stub_for_the_cron_gets_no_pickup(bound):
     assert not bound._pickups
 
 
-def test_an_enforced_harness_gets_a_pickup_on_the_panel_server_too(bound):
-    """Its tools call /api/agent-panel/* through mcp_core's request helper."""
-    panel = {"name": "kirocrew-panel", "command": sys.executable, "args": ["mcp-panel"], "env": []}
-    (out,) = _issue([panel])
+#: Servers whose tools call internal gateway routes through mcp_core's request helpers.
+_GATEWAY_ROUTE_SERVERS = {
+    "kirocrew-panel": "mcp-panel",
+    "kirocrew-mate": "mcp-mate",
+    "kirocrew-guide": "mcp-guide",
+    "kirocrew-work": "mcp-work",
+    "kirocrew-crew-log": "mcp-crew-log",
+    "kirocrew-debug": "mcp-debug",
+}
+
+
+@pytest.mark.parametrize("server", sorted(_GATEWAY_ROUTE_SERVERS))
+def test_an_enforced_harness_gets_a_pickup_on_each_gateway_route_server(bound, server):
+    element = {
+        "name": server,
+        "command": sys.executable,
+        "args": [_GATEWAY_ROUTE_SERVERS[server]],
+        "env": [],
+    }
+    (out,) = _issue([element])
     env = _env(out)
     assert len(env[PICKUP_ENV]) == 64
     assert env[GATEWAY_PID_ENV] == str(os.getpid())
     (entry,) = bound._pickups.values()
-    assert entry.session_token == "tok" and entry.server == "kirocrew-panel"
+    assert entry.session_token == "tok" and entry.server == server
 
 
-def test_a_broker_stub_for_the_panel_gets_no_pickup(bound):
+@pytest.mark.parametrize("server", sorted(_GATEWAY_ROUTE_SERVERS))
+def test_a_broker_stub_for_a_gateway_route_server_gets_no_pickup(bound, server):
     stub = {
-        "name": "kirocrew-panel",
+        "name": server,
         "command": sys.executable,
-        "args": ["-m", STUB_MODULE, "--server", "kirocrew-panel"],
+        "args": ["-m", STUB_MODULE, "--server", server],
         "env": [],
     }
     (out,) = _issue([stub])
@@ -269,17 +286,12 @@ def test_redemption_is_a_no_op_without_a_pickup_and_idempotent(monkeypatch):
     assert seen == [1]
 
 
-#: Managed servers that get no agent-socket pickup, with why and where it is tracked.
-#: A server is here because it has its own transport, or because its pickup is a
-#: pending follow-up; a new managed server lands in PICKUP_SERVERS or here.
-_PICKUP_EXEMPT: dict[str, tuple[str, str]] = {
-    "kirocrew-computer": ("own transport: loopback_urlopen with X-Internal-Secret", "exempt"),
-    "kirocrew-secrets": ("own transport: read_local_secret", "exempt"),
-    "kirocrew-mate": ("tracked: follow-up branch", "follow-up"),
-    "kirocrew-guide": ("tracked: follow-up branch", "follow-up"),
-    "kirocrew-work": ("tracked: follow-up branch", "follow-up"),
-    "kirocrew-crew-log": ("tracked: follow-up branch", "follow-up"),
-    "kirocrew-debug": ("tracked: follow-up branch", "follow-up"),
+#: Managed servers that get no agent-socket pickup, with why.
+#: A server is here because it has its own transport or no internal route; a new
+#: managed server lands in PICKUP_SERVERS or here.
+_PICKUP_EXEMPT: dict[str, str] = {
+    "kirocrew-computer": "own transport: loopback_urlopen with X-Internal-Secret",
+    "kirocrew-secrets": "own transport: read_local_secret",
 }
 
 
